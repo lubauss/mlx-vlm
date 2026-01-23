@@ -14,6 +14,24 @@ from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
 
+class FastRMSNorm(nn.Module):
+    """Optimized RMSNorm using mx.fast.rms_norm for better performance on Apple Silicon.
+
+    This replaces nn.RMSNorm with the fused mx.fast.rms_norm operation which
+    reduces the computation graph to a single node and runs significantly faster.
+
+    See: https://ml-explore.github.io/mlx/build/html/python/fast.html
+    """
+
+    def __init__(self, dims: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.eps = eps
+
+    def __call__(self, x):
+        return mx.fast.rms_norm(x, self.weight, self.eps)
+
+
 class Qwen3VLMoERotaryEmbedding:
     def __init__(
         self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
@@ -123,8 +141,8 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.q_norm = nn.RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
+        self.q_norm = FastRMSNorm(dims=head_dim, eps=args.rms_norm_eps)
+        self.k_norm = FastRMSNorm(dims=head_dim, eps=args.rms_norm_eps)
 
         self.rope_scaling = args.rope_scaling
 
@@ -221,6 +239,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
 
+        # P4: Force evaluation before switch_mlp to avoid lazy allocation overhead
+        # Only during prompt processing (batch > 1 token) - single token generation
+        # is fast enough that the sync overhead hurts more than helps
+        if x.shape[-2] > 1:  # Batch processing (prompt)
+            mx.eval(inds)
+
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
@@ -233,8 +257,8 @@ class Qwen3VLMoEDecoderLayer(nn.Module):
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
 
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
+        self.input_layernorm = FastRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = FastRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
@@ -272,7 +296,7 @@ class Qwen3VLMoEModel(nn.Module):
             Qwen3VLMoEDecoderLayer(args=args, layer_idx=layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = FastRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
