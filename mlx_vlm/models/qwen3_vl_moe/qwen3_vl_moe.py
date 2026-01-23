@@ -8,6 +8,14 @@ from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
+# Import vision embedding cache (F10 optimization)
+from mlx_vlm.utils import (
+    get_cached_vision_embedding,
+    cache_vision_embedding,
+    _hash_pixel_values,
+    VISION_CACHE_ENABLED,
+)
+
 
 def masked_scatter(
     final_embedding: mx.array,
@@ -60,10 +68,30 @@ class Model(nn.Module):
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Get the ouptut hidden states from the vision model
-        hidden_states, deepstack_image_embeds = self.vision_tower(
-            pixel_values, grid_thw
-        )
+        # F10: Check vision embedding cache before encoding
+        cache_key = None
+        cached_result = None
+        if VISION_CACHE_ENABLED:
+            cache_key = _hash_pixel_values(pixel_values)
+            cached_result = get_cached_vision_embedding(pixel_values, cache_key)
+
+        if cached_result is not None:
+            # Cache hit - skip vision encoding
+            hidden_states, deepstack_image_embeds = cached_result
+        else:
+            # Cache miss - run vision encoder
+            hidden_states, deepstack_image_embeds = self.vision_tower(
+                pixel_values, grid_thw
+            )
+            # Evaluate tensors before caching to break computation graph dependency
+            # This is critical for MLX's lazy evaluation - without this, cached tensors
+            # would still be tied to the original computation graph
+            mx.eval(hidden_states)
+            if deepstack_image_embeds is not None:
+                mx.eval(deepstack_image_embeds)
+            # Cache the result for future use
+            if VISION_CACHE_ENABLED:
+                cache_vision_embedding(pixel_values, hidden_states, deepstack_image_embeds, cache_key)
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
