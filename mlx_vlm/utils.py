@@ -3,10 +3,17 @@ import importlib
 import inspect
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Configurable parallel image loading settings
+# PARALLEL_IMAGE_WORKERS: Number of threads for parallel image loading/preprocessing
+# Set to 0 to disable parallel loading (sequential behavior)
+# Set to None to use default (min(32, cpu_count + 4))
+PARALLEL_IMAGE_WORKERS = None  # None = auto, 0 = disabled
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -673,6 +680,113 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def _load_single_image(args):
+    """
+    Helper function for parallel image loading.
+    Returns (index, pil_image, original_size) tuple.
+    """
+    idx, img, resize_shape, image_processor = args
+    try:
+        if isinstance(img, str):
+            pil_img = process_image(img, resize_shape, image_processor)
+        elif isinstance(img, Image.Image):
+            pil_img = img
+        else:
+            pil_img = img
+
+        # Get original size
+        if hasattr(pil_img, "height"):
+            original_size = (pil_img.height, pil_img.width)
+        else:
+            original_size = (0, 0)
+
+        return (idx, pil_img, original_size, None)
+    except Exception as e:
+        return (idx, None, (0, 0), str(e))
+
+
+def load_images_parallel(
+    images: List[Any],
+    image_processor: Any = None,
+    resize_shape: Optional[Tuple[int, int]] = None,
+    max_workers: Optional[int] = None,
+) -> Tuple[List[Any], List[Tuple[int, int]]]:
+    """
+    Load and preprocess multiple images in parallel using ThreadPoolExecutor.
+
+    This provides significant TTFT (Time To First Token) improvement for:
+    - Multiple images in a batch
+    - Images loaded from URLs (I/O bound)
+    - Large images requiring preprocessing (CPU bound)
+
+    Args:
+        images: List of image sources (paths, URLs, PIL Images, or base64 strings)
+        image_processor: Optional image processor for preprocessing
+        resize_shape: Optional resize dimensions
+        max_workers: Number of worker threads. None = auto, 0 = sequential (no parallelism)
+
+    Returns:
+        Tuple of (processed_images, original_sizes)
+
+    Example:
+        >>> from mlx_vlm import utils
+        >>> utils.PARALLEL_IMAGE_WORKERS = 4  # Use 4 threads
+        >>> images, sizes = utils.load_images_parallel(["img1.jpg", "img2.jpg"])
+    """
+    if not images:
+        return [], []
+
+    # Determine worker count
+    if max_workers is None:
+        max_workers = PARALLEL_IMAGE_WORKERS
+
+    # If parallelism is disabled or only one image, use sequential loading
+    if max_workers == 0 or len(images) == 1:
+        processed_images = []
+        image_sizes_original = []
+        for img in images:
+            if isinstance(img, str):
+                pil_img = process_image(img, resize_shape, image_processor)
+            elif isinstance(img, Image.Image):
+                pil_img = img
+            else:
+                pil_img = img
+            processed_images.append(pil_img)
+            if hasattr(pil_img, "height"):
+                image_sizes_original.append((pil_img.height, pil_img.width))
+            else:
+                image_sizes_original.append((0, 0))
+        return processed_images, image_sizes_original
+
+    # Prepare arguments for parallel execution
+    args_list = [
+        (idx, img, resize_shape, image_processor)
+        for idx, img in enumerate(images)
+    ]
+
+    # Execute in parallel
+    processed_images = [None] * len(images)
+    image_sizes_original = [(0, 0)] * len(images)
+    errors = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_load_single_image, args): args[0] for args in args_list}
+
+        for future in as_completed(futures):
+            idx, pil_img, original_size, error = future.result()
+            if error:
+                errors.append(f"Image {idx}: {error}")
+            else:
+                processed_images[idx] = pil_img
+                image_sizes_original[idx] = original_size
+
+    # Raise if any errors occurred
+    if errors:
+        raise ValueError(f"Failed to load images: {'; '.join(errors)}")
+
+    return processed_images, image_sizes_original
+
+
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     """Resample audio using linear interpolation."""
     if orig_sr == target_sr:
@@ -861,7 +975,8 @@ def prepare_inputs(
         image_processor = (
             processor.image_processor if hasattr(processor, "image_processor") else None
         )
-        images = [process_image(img, resize_shape, image_processor) for img in images]
+        # Use parallel loading for TTFT improvement (F3 optimization)
+        images, _ = load_images_parallel(images, image_processor, resize_shape)
 
         # For batching, we need uniform image sizes. Instead of padding to the
         # largest image (which adds white borders that hurt accuracy), we resize
