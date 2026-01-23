@@ -136,12 +136,36 @@ def get_vision_cache_stats() -> Dict[str, Any]:
 
 MULTIMODAL_KV_CACHE_ENABLED = True
 MULTIMODAL_KV_CACHE_MAX_SIZE = 0  # 0 = unlimited (context length is the natural limit)
+MULTIMODAL_KV_CACHE_TTL_SECONDS = 60  # Cache expires after 60s of inactivity (0 = no expiry)
 MULTIMODAL_KV_DEBUG = False  # Enable debug logging for prefix matching
 
 # Global multimodal KV cache with prefix matching support
 # Structure: {image_hash: [(token_ids, kv_states, num_tokens), ...]}
 _multimodal_prefix_cache: Dict[str, List[Tuple[List[int], Any, int]]] = {}
 _multimodal_cache_access_order: List[str] = []  # Track image_hash access for LRU
+_multimodal_cache_last_access: float = 0.0  # Timestamp of last cache access
+
+
+def _check_cache_ttl():
+    """Check if cache has expired due to inactivity and clear if needed."""
+    global _multimodal_cache_last_access
+    import time
+
+    if MULTIMODAL_KV_CACHE_TTL_SECONDS <= 0:
+        return  # TTL disabled
+
+    current_time = time.time()
+
+    # If cache exists and has expired, clear it
+    if _multimodal_prefix_cache and _multimodal_cache_last_access > 0:
+        elapsed = current_time - _multimodal_cache_last_access
+        if elapsed > MULTIMODAL_KV_CACHE_TTL_SECONDS:
+            if MULTIMODAL_KV_DEBUG:
+                print(f"[DEBUG] KV Cache EXPIRED: {elapsed:.1f}s since last access (TTL={MULTIMODAL_KV_CACHE_TTL_SECONDS}s)")
+            clear_multimodal_kv_cache()
+
+    # Update last access time
+    _multimodal_cache_last_access = current_time
 
 
 def _get_image_hash(pixel_values) -> str:
@@ -205,6 +229,9 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
     if not MULTIMODAL_KV_CACHE_ENABLED:
         return None, 0, ""
 
+    # Check TTL and clear expired cache (also updates last access time)
+    _check_cache_ttl()
+
     image_hash = _get_image_hash(pixel_values)
 
     # Convert input_ids to list for comparison
@@ -250,6 +277,9 @@ def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens
     if not MULTIMODAL_KV_CACHE_ENABLED:
         return
 
+    # Check TTL and clear expired cache (also updates last access time)
+    _check_cache_ttl()
+
     # Convert to list if needed
     if hasattr(token_ids, 'tolist'):
         token_list = token_ids.reshape(-1).tolist()
@@ -293,19 +323,31 @@ def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens
 
 def clear_multimodal_kv_cache():
     """Clear all cached multimodal KV states."""
-    global _multimodal_prefix_cache, _multimodal_cache_access_order
+    global _multimodal_prefix_cache, _multimodal_cache_access_order, _multimodal_cache_last_access
     _multimodal_prefix_cache.clear()
     _multimodal_cache_access_order.clear()
+    _multimodal_cache_last_access = 0.0
 
 
 def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
     """Get multimodal KV cache statistics."""
+    import time
     total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
+
+    # Calculate time until expiry
+    if MULTIMODAL_KV_CACHE_TTL_SECONDS > 0 and _multimodal_cache_last_access > 0:
+        elapsed = time.time() - _multimodal_cache_last_access
+        ttl_remaining = max(0, MULTIMODAL_KV_CACHE_TTL_SECONDS - elapsed)
+    else:
+        ttl_remaining = None
+
     return {
         "enabled": MULTIMODAL_KV_CACHE_ENABLED,
         "num_images": len(_multimodal_prefix_cache),
         "total_entries": total_entries,
         "max_size": "unlimited" if MULTIMODAL_KV_CACHE_MAX_SIZE == 0 else MULTIMODAL_KV_CACHE_MAX_SIZE,
+        "ttl_seconds": "disabled" if MULTIMODAL_KV_CACHE_TTL_SECONDS <= 0 else MULTIMODAL_KV_CACHE_TTL_SECONDS,
+        "ttl_remaining": ttl_remaining,
         "image_hashes": list(_multimodal_prefix_cache.keys()),
     }
 
