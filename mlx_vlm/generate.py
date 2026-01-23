@@ -20,6 +20,7 @@ from .utils import (
     apply_repetition_penalty,
     group_images_by_shape,
     load,
+    load_images_parallel,
     prepare_inputs,
 )
 
@@ -1027,26 +1028,17 @@ def batch_generate(
         )
         return BatchResponse(texts, stats)
 
-    # Load and preprocess images
+    # Load and preprocess images (parallel for better TTFT)
     image_processor = (
         processor.image_processor if hasattr(processor, "image_processor") else None
     )
 
-    processed_images = []
-    image_sizes_original = []
-    for img in images:
-        if isinstance(img, str):
-            pil_img = process_image(img, None, image_processor)
-        elif isinstance(img, Image.Image):
-            pil_img = img
-        else:
-            pil_img = img
-        processed_images.append(pil_img)
-        # Track original size
-        if hasattr(pil_img, "height"):
-            image_sizes_original.append((pil_img.height, pil_img.width))
-        else:
-            image_sizes_original.append((0, 0))
+    # Use parallel loading for multiple images or I/O-bound operations
+    processed_images, image_sizes_original = load_images_parallel(
+        images,
+        image_processor=image_processor,
+        resize_shape=None,
+    )
 
     # Group images by shape for efficient processing (no padding within groups)
     if group_by_shape and len(processed_images) > 1:
