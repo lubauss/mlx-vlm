@@ -15,6 +15,112 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 # Set to None to use default (min(32, cpu_count + 4))
 PARALLEL_IMAGE_WORKERS = None  # None = auto, 0 = disabled
 
+# Vision Embedding Cache (F10 optimization)
+# Caches vision encoder output to skip re-encoding same images
+# VISION_CACHE_ENABLED: Enable/disable vision embedding caching
+# VISION_CACHE_MAX_SIZE: Maximum number of cached embeddings (LRU eviction)
+VISION_CACHE_ENABLED = True
+VISION_CACHE_MAX_SIZE = 50  # Cache up to 50 different images
+
+# Global vision embedding cache (LRU-style dict)
+_vision_embedding_cache: Dict[str, Tuple[Any, Any]] = {}
+_vision_cache_order: List[str] = []  # Track access order for LRU
+
+
+def _hash_pixel_values(pixel_values) -> str:
+    """Create a hash key for pixel_values tensor for cache lookup."""
+    import hashlib
+    # Use shape + sample of values for fast hashing
+    shape_str = str(pixel_values.shape)
+    # Sample first, middle, last values for uniqueness
+    flat = pixel_values.reshape(-1)
+    n = flat.size
+    if n > 100:
+        # Sample 100 evenly spaced values
+        indices = [0, n//4, n//2, 3*n//4, n-1]
+        sample = [float(flat[i]) for i in indices]
+    else:
+        sample = [float(flat[i]) for i in range(min(10, n))]
+    sample_str = str(sample)
+    combined = f"{shape_str}_{sample_str}"
+    return hashlib.md5(combined.encode()).hexdigest()
+
+
+def get_cached_vision_embedding(pixel_values, cache_key: str = None):
+    """
+    Get cached vision embedding if available.
+
+    Args:
+        pixel_values: The pixel values tensor
+        cache_key: Optional pre-computed cache key
+
+    Returns:
+        Tuple of (hidden_states, deepstack_embeds) if cached, None otherwise
+    """
+    if not VISION_CACHE_ENABLED:
+        return None
+
+    if cache_key is None:
+        cache_key = _hash_pixel_values(pixel_values)
+
+    if cache_key in _vision_embedding_cache:
+        # Move to end for LRU
+        if cache_key in _vision_cache_order:
+            _vision_cache_order.remove(cache_key)
+        _vision_cache_order.append(cache_key)
+        return _vision_embedding_cache[cache_key]
+
+    return None
+
+
+def cache_vision_embedding(pixel_values, hidden_states, deepstack_embeds=None, cache_key: str = None):
+    """
+    Cache vision embedding for future reuse.
+
+    Args:
+        pixel_values: The pixel values tensor (used for key if cache_key not provided)
+        hidden_states: Vision encoder output
+        deepstack_embeds: Optional deepstack embeddings
+        cache_key: Optional pre-computed cache key
+    """
+    if not VISION_CACHE_ENABLED:
+        return
+
+    if cache_key is None:
+        cache_key = _hash_pixel_values(pixel_values)
+
+    # LRU eviction if at capacity
+    while len(_vision_embedding_cache) >= VISION_CACHE_MAX_SIZE:
+        if _vision_cache_order:
+            oldest_key = _vision_cache_order.pop(0)
+            _vision_embedding_cache.pop(oldest_key, None)
+        else:
+            # Fallback: clear first item
+            if _vision_embedding_cache:
+                first_key = next(iter(_vision_embedding_cache))
+                del _vision_embedding_cache[first_key]
+            break
+
+    _vision_embedding_cache[cache_key] = (hidden_states, deepstack_embeds)
+    _vision_cache_order.append(cache_key)
+
+
+def clear_vision_cache():
+    """Clear all cached vision embeddings."""
+    global _vision_embedding_cache, _vision_cache_order
+    _vision_embedding_cache.clear()
+    _vision_cache_order.clear()
+
+
+def get_vision_cache_stats() -> Dict[str, Any]:
+    """Get vision cache statistics."""
+    return {
+        "enabled": VISION_CACHE_ENABLED,
+        "size": len(_vision_embedding_cache),
+        "max_size": VISION_CACHE_MAX_SIZE,
+        "keys": list(_vision_embedding_cache.keys()),
+    }
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
