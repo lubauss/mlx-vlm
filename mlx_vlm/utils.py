@@ -135,7 +135,7 @@ def get_vision_cache_stats() -> Dict[str, Any]:
 # 4. Achieves text-like speedups (10-20x) for multi-turn vision conversations
 
 MULTIMODAL_KV_CACHE_ENABLED = True
-MULTIMODAL_KV_CACHE_MAX_SIZE = 20  # Cache up to 20 different entries
+MULTIMODAL_KV_CACHE_MAX_SIZE = 0  # 0 = unlimited (context length is the natural limit)
 MULTIMODAL_KV_DEBUG = False  # Enable debug logging for prefix matching
 
 # Global multimodal KV cache with prefix matching support
@@ -277,17 +277,18 @@ def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens
         _multimodal_cache_access_order.remove(image_hash)
     _multimodal_cache_access_order.append(image_hash)
 
-    # LRU eviction if at capacity (evict oldest image's entries)
-    total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
-    while total_entries > MULTIMODAL_KV_CACHE_MAX_SIZE and _multimodal_cache_access_order:
-        oldest_hash = _multimodal_cache_access_order.pop(0)
-        if oldest_hash in _multimodal_prefix_cache:
-            # Remove oldest entry for this image
-            if _multimodal_prefix_cache[oldest_hash]:
-                _multimodal_prefix_cache[oldest_hash].pop(0)
-                if not _multimodal_prefix_cache[oldest_hash]:
-                    del _multimodal_prefix_cache[oldest_hash]
-            total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
+    # LRU eviction if at capacity (skip if MAX_SIZE=0 for unlimited)
+    if MULTIMODAL_KV_CACHE_MAX_SIZE > 0:
+        total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
+        while total_entries > MULTIMODAL_KV_CACHE_MAX_SIZE and _multimodal_cache_access_order:
+            oldest_hash = _multimodal_cache_access_order.pop(0)
+            if oldest_hash in _multimodal_prefix_cache:
+                # Remove oldest entry for this image
+                if _multimodal_prefix_cache[oldest_hash]:
+                    _multimodal_prefix_cache[oldest_hash].pop(0)
+                    if not _multimodal_prefix_cache[oldest_hash]:
+                        del _multimodal_prefix_cache[oldest_hash]
+                total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
 
 
 def clear_multimodal_kv_cache():
@@ -304,7 +305,7 @@ def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
         "enabled": MULTIMODAL_KV_CACHE_ENABLED,
         "num_images": len(_multimodal_prefix_cache),
         "total_entries": total_entries,
-        "max_size": MULTIMODAL_KV_CACHE_MAX_SIZE,
+        "max_size": "unlimited" if MULTIMODAL_KV_CACHE_MAX_SIZE == 0 else MULTIMODAL_KV_CACHE_MAX_SIZE,
         "image_hashes": list(_multimodal_prefix_cache.keys()),
     }
 
