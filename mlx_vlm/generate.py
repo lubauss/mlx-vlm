@@ -27,6 +27,7 @@ from .utils import (
     cache_multimodal_kv_prefix,
     _get_image_hash,
     MULTIMODAL_KV_CACHE_ENABLED,
+    MULTIMODAL_KV_DEBUG,
 )
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
@@ -341,7 +342,6 @@ def generate_step(
         cached_kv, prefix_match_len, mm_image_hash = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
 
         # Debug output
-        from mlx_vlm.utils import MULTIMODAL_KV_DEBUG
         if MULTIMODAL_KV_DEBUG:
             cached_kv_valid = cached_kv is not None and all(kv is not None for kv in cached_kv[:3] if cached_kv)
             print(f"[DEBUG] generate_step: cached_kv={cached_kv is not None}, prefix_match_len={prefix_match_len}, kv_valid={cached_kv_valid}")
@@ -380,9 +380,7 @@ def generate_step(
 
     # PREFIX CACHING: Handle different cache scenarios
     if MULTIMODAL_KV_DEBUG:
-        from mlx_vlm.utils import MULTIMODAL_KV_DEBUG as _DEBUG
-        if _DEBUG:
-            print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}")
+        print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}")
     if skip_prompt_processing and prompt_cache is not None:
         # EXACT cache hit - skip all prompt processing, just get logits for last token
         last_token = input_ids[:, -1:]
