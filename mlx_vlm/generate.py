@@ -1088,6 +1088,7 @@ def batch_generate(
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
+    uniform_size: Optional[Tuple[int, int]] = None,
     **kwargs,
 ):
     """
@@ -1146,12 +1147,25 @@ def batch_generate(
         processor.image_processor if hasattr(processor, "image_processor") else None
     )
 
+    # Extract resize_shape if provided (enables uniform batching for different-sized images)
+    resize_shape = kwargs.get("resize_shape", None)
+
     # Use parallel loading for multiple images or I/O-bound operations
     processed_images, image_sizes_original = load_images_parallel(
         images,
         image_processor=image_processor,
-        resize_shape=None,
+        resize_shape=resize_shape,
     )
+
+    # Force all images to uniform size for single-batch processing (may distort aspect ratio)
+    if uniform_size is not None:
+        from PIL import Image
+        processed_images = [
+            img.resize(uniform_size, Image.Resampling.LANCZOS) if img.size != uniform_size else img
+            for img in processed_images
+        ]
+        if verbose:
+            print(f"[batch_generate] Resized all images to uniform {uniform_size}")
 
     # Group images by shape for efficient processing (no padding within groups)
     if group_by_shape and len(processed_images) > 1:
