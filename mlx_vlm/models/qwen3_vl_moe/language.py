@@ -344,21 +344,31 @@ class Qwen3VLMoEModel(nn.Module):
     ):
         batch_size = hidden_states.shape[0]
 
+        # For batched inputs, visual_embeds contains ALL visual tokens concatenated.
+        # We need to slice it per-batch based on how many visual tokens each item has.
+        visual_token_counts = [int(visual_pos_masks[b].sum()) for b in range(batch_size)]
+        visual_embed_offset = 0
+
         updated_batches = []
         for b in range(batch_size):
             batch_mask = visual_pos_masks[b]
             batch_hidden = hidden_states[b]
 
             batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
+            num_visual_tokens = visual_token_counts[b]
 
-            if len(batch_indices) == 0:
+            if num_visual_tokens == 0:
                 updated_batches.append(batch_hidden)
                 continue
 
-            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
-            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+            # Slice visual embeddings for this batch item
+            batch_visual_embeds = visual_embeds[visual_embed_offset:visual_embed_offset + num_visual_tokens]
+            visual_embed_offset += num_visual_tokens
 
-            updated_batches.append(batch_hidden)
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(batch_visual_embeds)
+
+            updated_batches.append(batch_result)
 
         return mx.stack(updated_batches, axis=0)
 

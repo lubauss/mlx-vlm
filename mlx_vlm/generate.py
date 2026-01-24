@@ -1271,31 +1271,92 @@ def _generate_batch(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    inputs = prepare_inputs(
-        processor,
-        images=images,
-        audio=None,
-        prompts=formatted_prompts,
-        image_token_index=image_token_index,
-        resize_shape=resize_shape,
-        add_special_tokens=add_special_tokens,
-        pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
-    )
-    input_ids = inputs.get("input_ids", None)
-    pixel_values = inputs.get("pixel_values", None)
+    # Qwen3-VL has a processor bug where it counts image tokens across all prompts
+    # but image_grid_thw only has entries per image. Process inputs one at a time.
+    is_qwen3_vl = model.config.model_type in ["qwen3_vl", "qwen3_vl_moe"]
 
-    data_kwargs = {
-        k: v
-        for k, v in inputs.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
-    }
+    if is_qwen3_vl and images is not None and len(images) > 1:
+        # Process each image-prompt pair individually, then stack
+        all_inputs = []
+        for i in range(batch_size):
+            img = [images[i]] if i < len(images) else None
+            prompt = [formatted_prompts[i]]
+            inp = prepare_inputs(
+                processor,
+                images=img,
+                audio=None,
+                prompts=prompt,
+                image_token_index=image_token_index,
+                resize_shape=resize_shape,
+                add_special_tokens=add_special_tokens,
+                pad_to_uniform_size=False,
+            )
+            all_inputs.append(inp)
+
+        # Find max sequence length for padding
+        max_seq_len = max(inp["input_ids"].shape[-1] for inp in all_inputs)
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        # Stack inputs with padding
+        padded_input_ids = []
+        for inp in all_inputs:
+            ids = inp["input_ids"]
+            if ids.ndim == 1:
+                ids = ids[None, :]
+            seq_len = ids.shape[-1]
+            if seq_len < max_seq_len:
+                padding = mx.full((ids.shape[0], max_seq_len - seq_len), pad_token_id)
+                ids = mx.concatenate([ids, padding], axis=-1)
+            padded_input_ids.append(ids)
+
+        input_ids = mx.concatenate(padded_input_ids, axis=0)
+        pixel_values = mx.concatenate([inp["pixel_values"] for inp in all_inputs], axis=0)
+
+        # Merge data_kwargs from all inputs (take first non-None for each key)
+        data_kwargs = {}
+        for key in all_inputs[0].keys():
+            if key not in ["input_ids", "pixel_values", "attention_mask"]:
+                vals = [inp.get(key) for inp in all_inputs if inp.get(key) is not None]
+                if vals:
+                    if isinstance(vals[0], mx.array):
+                        data_kwargs[key] = mx.concatenate(vals, axis=0)
+                    else:
+                        data_kwargs[key] = vals[0]
+    else:
+        inputs = prepare_inputs(
+            processor,
+            images=images,
+            audio=None,
+            prompts=formatted_prompts,
+            image_token_index=image_token_index,
+            resize_shape=resize_shape,
+            add_special_tokens=add_special_tokens,
+            pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
+        )
+        input_ids = inputs.get("input_ids", None)
+        pixel_values = inputs.get("pixel_values", None)
+
+        data_kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
 
     # Use batch_size for prefill and completion to ensure consistent processing
+    # For Qwen3-VL with images, use large prefill_step_size to avoid chunking issues
+    # (chunked prefill causes RoPE position mismatch with image tokens)
+    gen_kwargs_extra = {}
+    if is_qwen3_vl and images is not None:
+        # Set prefill_step_size large enough to process entire sequence at once
+        seq_len = input_ids.shape[-1] if input_ids is not None else 32768
+        gen_kwargs_extra["prefill_step_size"] = max(seq_len + 1, 32768)
+
     gen = BatchGenerator(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
+        **gen_kwargs_extra,
         **kwargs,
     )
 
