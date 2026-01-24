@@ -57,8 +57,7 @@ class FastRMSNorm(nn.Module):
         self.dims = dims
 
     def __call__(self, x):
-        # mx.fast.rms_norm expects weight as (1 + weight) for numerical stability
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 # =============================================================================
