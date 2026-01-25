@@ -28,6 +28,7 @@ from .utils import (
     _get_image_hash,
     MULTIMODAL_KV_CACHE_ENABLED,
     MULTIMODAL_KV_DEBUG,
+    VISION_CRITICAL_LAYERS,
 )
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
@@ -353,15 +354,24 @@ def generate_step(
         if cached_kv is not None and prefix_match_len > 0:
             total_tokens = input_ids.size
 
-            # For cross-image matches (partial KV), we DON'T restore cache
-            # Instead, we'll do a full forward pass with new images
-            # The model will compute fresh KV for all layers including new image tokens
+            # For cross-image matches (partial KV), we detect but DON'T restore partial cache
+            # Reason: Restoring partial cache causes offset mismatch with full forward pass
+            # The model expects either full cache (skip tokens) or no cache (process all)
+            # Partial restore (some layers cached, some not) creates computation conflicts
+            #
+            # Future optimization: Implement true selective layer recomputation where
+            # we can process the prompt in two stages:
+            # 1. Layers 0-7: full forward pass with new images
+            # 2. Layers 8+: use cached KV and only process new token positions
+            # This requires deeper model architecture changes.
             if is_partial_kv:
                 mm_cross_image_hit = True
                 if MULTIMODAL_KV_DEBUG:
                     n_cached = sum(1 for kv in cached_kv if kv is not None)
-                    print(f"[DEBUG] CROSS-IMAGE MATCH: {n_cached}/{len(cached_kv)} layers cached, will do full forward pass with new images")
-                # Don't restore partial KV - do full forward pass instead
+                    print(f"[DEBUG] CROSS-IMAGE DETECTED: {n_cached}/{len(cached_kv)} layers could be reused")
+                    print(f"[DEBUG]   Currently falling back to full forward pass for accuracy")
+                    print(f"[DEBUG]   TODO: Implement staged forward pass for {VISION_CRITICAL_LAYERS} vision-critical layers")
+                # Don't restore partial cache - do clean full forward pass
             else:
                 # Full KV match - safe to restore all layers
                 try:
