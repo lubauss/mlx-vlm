@@ -279,10 +279,24 @@ class Qwen3VLModel(nn.Module):
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        # Staged forward pass support for selective layer recomputation
+        layer_start: int = 0,
+        layer_end: Optional[int] = None,
+        skip_final_norm: bool = False,
     ):
-        if inputs_embeds is None:
-            h = self.embed_tokens(inputs)
+        if layer_end is None:
+            layer_end = len(self.layers)
+
+        # Only embed tokens if starting from layer 0
+        if layer_start == 0:
+            if inputs_embeds is None:
+                h = self.embed_tokens(inputs)
+            else:
+                h = inputs_embeds
         else:
+            # For non-zero start, inputs_embeds must be provided (intermediate hidden states)
+            if inputs_embeds is None:
+                raise ValueError("inputs_embeds must be provided when layer_start > 0")
             h = inputs_embeds
 
         if cache is None:
@@ -290,9 +304,13 @@ class Qwen3VLModel(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
-        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+
+        # Process only the specified layer range
+        for layer_idx in range(layer_start, layer_end):
+            layer = self.layers[layer_idx]
+            c = cache[layer_idx]
             h = layer(h, mask, c, position_ids)
-            # Add deepstack visual embeds
+            # Add deepstack visual embeds (only for layers 0 to len(deepstack_visual_embeds)-1)
             if deepstack_visual_embeds is not None and layer_idx in range(
                 len(deepstack_visual_embeds)
             ):
@@ -302,6 +320,9 @@ class Qwen3VLModel(nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
+        # Skip final norm for intermediate outputs (staged forward pass)
+        if skip_final_norm:
+            return h
         return self.norm(h)
 
     def _deepstack_process(
@@ -529,6 +550,10 @@ class LanguageModel(nn.Module):
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        # Staged forward pass support
+        layer_start: int = 0,
+        layer_end: Optional[int] = None,
+        skip_final_norm: bool = False,
         **kwargs,
     ):
 
@@ -592,7 +617,15 @@ class LanguageModel(nn.Module):
             position_ids=position_ids,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            skip_final_norm=skip_final_norm,
         )
+
+        # If skip_final_norm, return intermediate hidden states (for staged forward pass)
+        if skip_final_norm:
+            return out  # Return raw hidden states, not LanguageModelOutput
+
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
