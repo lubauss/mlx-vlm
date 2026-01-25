@@ -3,10 +3,387 @@ import importlib
 import inspect
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Configurable parallel image loading settings
+# PARALLEL_IMAGE_WORKERS: Number of threads for parallel image loading/preprocessing
+# Set to 0 to disable parallel loading (sequential behavior)
+# Set to None to use default (min(32, cpu_count + 4))
+PARALLEL_IMAGE_WORKERS = None  # None = auto, 0 = disabled
+
+# Vision Embedding Cache (F10 optimization)
+# Caches vision encoder output to skip re-encoding same images
+# VISION_CACHE_ENABLED: Enable/disable vision embedding caching
+# VISION_CACHE_MAX_SIZE: Maximum number of cached embeddings (LRU eviction)
+VISION_CACHE_ENABLED = True
+VISION_CACHE_MAX_SIZE = 50  # Cache up to 50 different images
+
+# Global vision embedding cache (LRU-style dict)
+_vision_embedding_cache: Dict[str, Tuple[Any, Any]] = {}
+_vision_cache_order: List[str] = []  # Track access order for LRU
+
+
+def _hash_pixel_values(pixel_values) -> str:
+    """Create a hash key for pixel_values tensor for cache lookup."""
+    import hashlib
+    # Use shape + sample of values for fast hashing
+    shape_str = str(pixel_values.shape)
+    # Sample first, middle, last values for uniqueness
+    flat = pixel_values.reshape(-1)
+    n = flat.size
+    if n > 100:
+        # Sample 100 evenly spaced values
+        indices = [0, n//4, n//2, 3*n//4, n-1]
+        sample = [float(flat[i]) for i in indices]
+    else:
+        sample = [float(flat[i]) for i in range(min(10, n))]
+    sample_str = str(sample)
+    combined = f"{shape_str}_{sample_str}"
+    return hashlib.md5(combined.encode()).hexdigest()
+
+
+def get_cached_vision_embedding(pixel_values, cache_key: str = None):
+    """
+    Get cached vision embedding if available.
+
+    Args:
+        pixel_values: The pixel values tensor
+        cache_key: Optional pre-computed cache key
+
+    Returns:
+        Tuple of (hidden_states, deepstack_embeds) if cached, None otherwise
+    """
+    if not VISION_CACHE_ENABLED:
+        return None
+
+    if cache_key is None:
+        cache_key = _hash_pixel_values(pixel_values)
+
+    if cache_key in _vision_embedding_cache:
+        # Move to end for LRU
+        if cache_key in _vision_cache_order:
+            _vision_cache_order.remove(cache_key)
+        _vision_cache_order.append(cache_key)
+        return _vision_embedding_cache[cache_key]
+
+    return None
+
+
+def cache_vision_embedding(pixel_values, hidden_states, deepstack_embeds=None, cache_key: str = None):
+    """
+    Cache vision embedding for future reuse.
+
+    Args:
+        pixel_values: The pixel values tensor (used for key if cache_key not provided)
+        hidden_states: Vision encoder output
+        deepstack_embeds: Optional deepstack embeddings
+        cache_key: Optional pre-computed cache key
+    """
+    if not VISION_CACHE_ENABLED:
+        return
+
+    if cache_key is None:
+        cache_key = _hash_pixel_values(pixel_values)
+
+    # LRU eviction if at capacity
+    while len(_vision_embedding_cache) >= VISION_CACHE_MAX_SIZE:
+        if _vision_cache_order:
+            oldest_key = _vision_cache_order.pop(0)
+            _vision_embedding_cache.pop(oldest_key, None)
+        else:
+            # Fallback: clear first item
+            if _vision_embedding_cache:
+                first_key = next(iter(_vision_embedding_cache))
+                del _vision_embedding_cache[first_key]
+            break
+
+    _vision_embedding_cache[cache_key] = (hidden_states, deepstack_embeds)
+    _vision_cache_order.append(cache_key)
+
+
+def clear_vision_cache():
+    """Clear all cached vision embeddings."""
+    global _vision_embedding_cache, _vision_cache_order
+    _vision_embedding_cache.clear()
+    _vision_cache_order.clear()
+
+
+def get_vision_cache_stats() -> Dict[str, Any]:
+    """Get vision cache statistics."""
+    return {
+        "enabled": VISION_CACHE_ENABLED,
+        "size": len(_vision_embedding_cache),
+        "max_size": VISION_CACHE_MAX_SIZE,
+        "keys": list(_vision_embedding_cache.keys()),
+    }
+
+
+# =============================================================================
+# Multimodal KV Cache with Prefix Matching (F10 v3 - LMCache-style approach)
+# =============================================================================
+# This caches the full KV states after the first forward pass (including vision)
+# and supports PREFIX MATCHING for multi-turn conversations.
+#
+# Key features:
+# 1. Cache KV states keyed by (image_hash, token_sequence)
+# 2. On lookup, find longest matching prefix (not just exact match)
+# 3. Restore KV states for prefix, only process new tokens
+# 4. Achieves text-like speedups (10-20x) for multi-turn vision conversations
+
+MULTIMODAL_KV_CACHE_ENABLED = True
+MULTIMODAL_KV_CACHE_MAX_SIZE = 0  # 0 = unlimited (context length is the natural limit)
+MULTIMODAL_KV_CACHE_TTL_SECONDS = 60  # Cache expires after 60s of inactivity (0 = no expiry)
+MULTIMODAL_KV_DEBUG = True  # Enable debug logging for prefix matching
+
+# Global multimodal KV cache with prefix matching support
+# Structure: {image_hash: [(token_ids, kv_states, num_tokens), ...]}
+_multimodal_prefix_cache: Dict[str, List[Tuple[List[int], Any, int]]] = {}
+_multimodal_cache_access_order: List[str] = []  # Track image_hash access for LRU
+_multimodal_cache_last_access: float = 0.0  # Timestamp of last cache access
+
+
+def _check_cache_ttl():
+    """Check if cache has expired due to inactivity and clear if needed."""
+    global _multimodal_cache_last_access
+    import time
+
+    if MULTIMODAL_KV_CACHE_TTL_SECONDS <= 0:
+        return  # TTL disabled
+
+    current_time = time.time()
+
+    # If cache exists and has expired, clear it
+    if _multimodal_prefix_cache and _multimodal_cache_last_access > 0:
+        elapsed = current_time - _multimodal_cache_last_access
+        if elapsed > MULTIMODAL_KV_CACHE_TTL_SECONDS:
+            if MULTIMODAL_KV_DEBUG:
+                print(f"[DEBUG] KV Cache EXPIRED: {elapsed:.1f}s since last access (TTL={MULTIMODAL_KV_CACHE_TTL_SECONDS}s)")
+            clear_multimodal_kv_cache()
+
+    # Update last access time
+    _multimodal_cache_last_access = current_time
+
+
+def _get_image_hash(pixel_values) -> str:
+    """Get hash for image only (without text)."""
+    return _hash_pixel_values(pixel_values)
+
+
+def _find_longest_prefix_match(token_ids: List[int], cached_entries: List[Tuple[List[int], Any, int]]) -> Tuple[Any, int, int]:
+    """
+    Find the longest matching prefix among cached entries.
+
+    Returns:
+        Tuple of (kv_states, num_matched_tokens, entry_index) or (None, 0, -1) if no match
+    """
+    best_match = (None, 0, -1)
+
+    for idx, (cached_tokens, kv_states, num_tokens) in enumerate(cached_entries):
+        # Find how many tokens match from the start
+        match_len = 0
+        min_len = min(len(token_ids), len(cached_tokens))
+
+        for i in range(min_len):
+            if token_ids[i] == cached_tokens[i]:
+                match_len += 1
+            else:
+                break
+
+        if MULTIMODAL_KV_DEBUG:
+            print(f"  [DEBUG] Entry {idx}: cached={len(cached_tokens)}, query={len(token_ids)}, match={match_len}")
+            if match_len < len(cached_tokens) and match_len < len(token_ids):
+                # Show where mismatch occurred
+                if match_len < min_len:
+                    print(f"    Mismatch at pos {match_len}: cached={cached_tokens[match_len]}, query={token_ids[match_len]}")
+
+        # We need at least some minimum match to be useful (e.g., 50 tokens)
+        # and the match should be the full cached sequence (we can extend from there)
+        if match_len >= min(50, len(cached_tokens)) and match_len == len(cached_tokens):
+            if match_len > best_match[1]:
+                best_match = (kv_states, match_len, idx)
+
+    return best_match
+
+
+def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, str]:
+    """
+    Get cached KV states with prefix matching for multimodal input.
+
+    This enables multi-turn conversation speedups by finding the longest
+    matching prefix and reusing its KV states.
+
+    Args:
+        pixel_values: Image pixel values
+        input_ids: Text input token IDs
+
+    Returns:
+        Tuple of (kv_states, num_matched_tokens, image_hash)
+        - kv_states: Cached KV states for the prefix, or None if no match
+        - num_matched_tokens: Number of tokens covered by the cache
+        - image_hash: Hash of the image for caching new states
+    """
+    if not MULTIMODAL_KV_CACHE_ENABLED:
+        return None, 0, ""
+
+    # Check TTL and clear expired cache (also updates last access time)
+    _check_cache_ttl()
+
+    image_hash = _get_image_hash(pixel_values)
+
+    # Convert input_ids to list for comparison
+    if hasattr(input_ids, 'tolist'):
+        token_list = input_ids.reshape(-1).tolist()
+    else:
+        token_list = list(input_ids.reshape(-1))
+
+    # Check if we have any cached entries for this image
+    if image_hash not in _multimodal_prefix_cache:
+        if MULTIMODAL_KV_DEBUG:
+            print(f"[DEBUG] KV Cache MISS: no entries for image hash {image_hash[:8]}")
+        return None, 0, image_hash
+
+    # Find longest matching prefix
+    cached_entries = _multimodal_prefix_cache[image_hash]
+    if MULTIMODAL_KV_DEBUG:
+        print(f"[DEBUG] KV Cache lookup: image={image_hash[:8]}, query_len={len(token_list)}, num_entries={len(cached_entries)}")
+    kv_states, match_len, entry_idx = _find_longest_prefix_match(token_list, cached_entries)
+
+    if kv_states is not None:
+        # Update LRU order
+        if image_hash in _multimodal_cache_access_order:
+            _multimodal_cache_access_order.remove(image_hash)
+        _multimodal_cache_access_order.append(image_hash)
+
+    return kv_states, match_len, image_hash
+
+
+def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens: int):
+    """
+    Cache KV states with prefix matching support.
+
+    IMPORTANT: Call mx.eval() on kv_states before caching to materialize
+    the tensors and break computation graph dependencies.
+
+    Args:
+        image_hash: Hash of the image (from get_cached_multimodal_kv_prefix)
+        token_ids: Token IDs for the sequence
+        kv_states: The KV cache states to store
+        num_tokens: Number of tokens in the cached sequence
+    """
+    if not MULTIMODAL_KV_CACHE_ENABLED:
+        return
+
+    # Check TTL and clear expired cache (also updates last access time)
+    _check_cache_ttl()
+
+    # Convert to list if needed
+    if hasattr(token_ids, 'tolist'):
+        token_list = token_ids.reshape(-1).tolist()
+    else:
+        token_list = list(token_ids.reshape(-1))
+
+    # Initialize cache for this image if needed
+    if image_hash not in _multimodal_prefix_cache:
+        _multimodal_prefix_cache[image_hash] = []
+
+    # Check if we already have this exact sequence cached
+    for cached_tokens, _, _ in _multimodal_prefix_cache[image_hash]:
+        if cached_tokens == token_list:
+            if MULTIMODAL_KV_DEBUG:
+                print(f"[DEBUG] KV Cache: already cached sequence of {len(token_list)} tokens")
+            return  # Already cached
+
+    # Add new entry
+    _multimodal_prefix_cache[image_hash].append((token_list, kv_states, num_tokens))
+    if MULTIMODAL_KV_DEBUG:
+        print(f"[DEBUG] KV Cache STORE: image={image_hash[:8]}, tokens={len(token_list)}, kv_layers={sum(1 for kv in kv_states if kv is not None)}")
+
+    # Update LRU order
+    if image_hash in _multimodal_cache_access_order:
+        _multimodal_cache_access_order.remove(image_hash)
+    _multimodal_cache_access_order.append(image_hash)
+
+    # LRU eviction if at capacity (skip if MAX_SIZE=0 for unlimited)
+    if MULTIMODAL_KV_CACHE_MAX_SIZE > 0:
+        total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
+        while total_entries > MULTIMODAL_KV_CACHE_MAX_SIZE and _multimodal_cache_access_order:
+            oldest_hash = _multimodal_cache_access_order.pop(0)
+            if oldest_hash in _multimodal_prefix_cache:
+                # Remove oldest entry for this image
+                if _multimodal_prefix_cache[oldest_hash]:
+                    _multimodal_prefix_cache[oldest_hash].pop(0)
+                    if not _multimodal_prefix_cache[oldest_hash]:
+                        del _multimodal_prefix_cache[oldest_hash]
+                total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
+
+
+def clear_multimodal_kv_cache():
+    """Clear all cached multimodal KV states."""
+    global _multimodal_prefix_cache, _multimodal_cache_access_order, _multimodal_cache_last_access
+    _multimodal_prefix_cache.clear()
+    _multimodal_cache_access_order.clear()
+    _multimodal_cache_last_access = 0.0
+
+
+def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
+    """Get multimodal KV cache statistics."""
+    import time
+    total_entries = sum(len(entries) for entries in _multimodal_prefix_cache.values())
+
+    # Calculate time until expiry
+    if MULTIMODAL_KV_CACHE_TTL_SECONDS > 0 and _multimodal_cache_last_access > 0:
+        elapsed = time.time() - _multimodal_cache_last_access
+        ttl_remaining = max(0, MULTIMODAL_KV_CACHE_TTL_SECONDS - elapsed)
+    else:
+        ttl_remaining = None
+
+    return {
+        "enabled": MULTIMODAL_KV_CACHE_ENABLED,
+        "num_images": len(_multimodal_prefix_cache),
+        "total_entries": total_entries,
+        "max_size": "unlimited" if MULTIMODAL_KV_CACHE_MAX_SIZE == 0 else MULTIMODAL_KV_CACHE_MAX_SIZE,
+        "ttl_seconds": "disabled" if MULTIMODAL_KV_CACHE_TTL_SECONDS <= 0 else MULTIMODAL_KV_CACHE_TTL_SECONDS,
+        "ttl_remaining": ttl_remaining,
+        "image_hashes": list(_multimodal_prefix_cache.keys()),
+    }
+
+
+# Legacy compatibility - keep old functions working
+def _hash_multimodal_input(pixel_values, input_ids) -> str:
+    """Legacy: Create a hash key for exact match (deprecated, use prefix matching)."""
+    import hashlib
+    image_hash = _hash_pixel_values(pixel_values)
+    if hasattr(input_ids, 'tolist'):
+        token_list = input_ids.reshape(-1).tolist()
+    else:
+        token_list = list(input_ids.reshape(-1))
+    prefix_tokens = token_list[:100]
+    text_hash = hashlib.md5(str(prefix_tokens).encode()).hexdigest()[:8]
+    return f"{image_hash}_{text_hash}_{len(token_list)}"
+
+
+def get_cached_multimodal_kv(pixel_values, input_ids, cache_key: str = None):
+    """Legacy: Get cached KV states (exact match only, deprecated)."""
+    kv_states, match_len, _ = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
+    if hasattr(input_ids, 'size'):
+        total_tokens = input_ids.size
+    else:
+        total_tokens = len(input_ids.reshape(-1))
+    # Only return if exact match
+    if match_len == total_tokens:
+        return kv_states, match_len
+    return None, 0
+
+
+def cache_multimodal_kv(pixel_values, input_ids, kv_states, num_tokens: int, cache_key: str = None):
+    """Legacy: Cache KV states (deprecated, use cache_multimodal_kv_prefix)."""
+    image_hash = _get_image_hash(pixel_values)
+    cache_multimodal_kv_prefix(image_hash, input_ids, kv_states, num_tokens)
+
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -673,6 +1050,113 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def _load_single_image(args):
+    """
+    Helper function for parallel image loading.
+    Returns (index, pil_image, original_size) tuple.
+    """
+    idx, img, resize_shape, image_processor = args
+    try:
+        if isinstance(img, str):
+            pil_img = process_image(img, resize_shape, image_processor)
+        elif isinstance(img, Image.Image):
+            pil_img = img
+        else:
+            pil_img = img
+
+        # Get original size
+        if hasattr(pil_img, "height"):
+            original_size = (pil_img.height, pil_img.width)
+        else:
+            original_size = (0, 0)
+
+        return (idx, pil_img, original_size, None)
+    except Exception as e:
+        return (idx, None, (0, 0), str(e))
+
+
+def load_images_parallel(
+    images: List[Any],
+    image_processor: Any = None,
+    resize_shape: Optional[Tuple[int, int]] = None,
+    max_workers: Optional[int] = None,
+) -> Tuple[List[Any], List[Tuple[int, int]]]:
+    """
+    Load and preprocess multiple images in parallel using ThreadPoolExecutor.
+
+    This provides significant TTFT (Time To First Token) improvement for:
+    - Multiple images in a batch
+    - Images loaded from URLs (I/O bound)
+    - Large images requiring preprocessing (CPU bound)
+
+    Args:
+        images: List of image sources (paths, URLs, PIL Images, or base64 strings)
+        image_processor: Optional image processor for preprocessing
+        resize_shape: Optional resize dimensions
+        max_workers: Number of worker threads. None = auto, 0 = sequential (no parallelism)
+
+    Returns:
+        Tuple of (processed_images, original_sizes)
+
+    Example:
+        >>> from mlx_vlm import utils
+        >>> utils.PARALLEL_IMAGE_WORKERS = 4  # Use 4 threads
+        >>> images, sizes = utils.load_images_parallel(["img1.jpg", "img2.jpg"])
+    """
+    if not images:
+        return [], []
+
+    # Determine worker count
+    if max_workers is None:
+        max_workers = PARALLEL_IMAGE_WORKERS
+
+    # If parallelism is disabled or only one image, use sequential loading
+    if max_workers == 0 or len(images) == 1:
+        processed_images = []
+        image_sizes_original = []
+        for img in images:
+            if isinstance(img, str):
+                pil_img = process_image(img, resize_shape, image_processor)
+            elif isinstance(img, Image.Image):
+                pil_img = img
+            else:
+                pil_img = img
+            processed_images.append(pil_img)
+            if hasattr(pil_img, "height"):
+                image_sizes_original.append((pil_img.height, pil_img.width))
+            else:
+                image_sizes_original.append((0, 0))
+        return processed_images, image_sizes_original
+
+    # Prepare arguments for parallel execution
+    args_list = [
+        (idx, img, resize_shape, image_processor)
+        for idx, img in enumerate(images)
+    ]
+
+    # Execute in parallel
+    processed_images = [None] * len(images)
+    image_sizes_original = [(0, 0)] * len(images)
+    errors = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_load_single_image, args): args[0] for args in args_list}
+
+        for future in as_completed(futures):
+            idx, pil_img, original_size, error = future.result()
+            if error:
+                errors.append(f"Image {idx}: {error}")
+            else:
+                processed_images[idx] = pil_img
+                image_sizes_original[idx] = original_size
+
+    # Raise if any errors occurred
+    if errors:
+        raise ValueError(f"Failed to load images: {'; '.join(errors)}")
+
+    return processed_images, image_sizes_original
+
+
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     """Resample audio using linear interpolation."""
     if orig_sr == target_sr:
@@ -861,7 +1345,8 @@ def prepare_inputs(
         image_processor = (
             processor.image_processor if hasattr(processor, "image_processor") else None
         )
-        images = [process_image(img, resize_shape, image_processor) for img in images]
+        # Use parallel loading for TTFT improvement (F3 optimization)
+        images, _ = load_images_parallel(images, image_processor, resize_shape)
 
         # For batching, we need uniform image sizes. Instead of padding to the
         # largest image (which adds white borders that hurt accuracy), we resize

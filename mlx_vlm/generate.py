@@ -20,7 +20,14 @@ from .utils import (
     apply_repetition_penalty,
     group_images_by_shape,
     load,
+    load_images_parallel,
     prepare_inputs,
+    # Multimodal KV cache with prefix matching (F10 v3)
+    get_cached_multimodal_kv_prefix,
+    cache_multimodal_kv_prefix,
+    _get_image_hash,
+    MULTIMODAL_KV_CACHE_ENABLED,
+    MULTIMODAL_KV_DEBUG,
 )
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
@@ -325,12 +332,58 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
 
-    # PREFIX CACHING: Skip full forward pass if cache is pre-populated
+    # F10 v3: Check multimodal KV cache with PREFIX MATCHING
+    mm_cache_hit = False
+    mm_prefix_hit = False
+    mm_image_hash = None
+    prefix_match_len = 0
+
+    if MULTIMODAL_KV_CACHE_ENABLED and pixel_values is not None and not skip_prompt_processing:
+        cached_kv, prefix_match_len, mm_image_hash = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
+
+        # Debug output
+        if MULTIMODAL_KV_DEBUG:
+            cached_kv_valid = cached_kv is not None and all(kv is not None for kv in cached_kv[:3] if cached_kv)
+            print(f"[DEBUG] generate_step: cached_kv={cached_kv is not None}, prefix_match_len={prefix_match_len}, kv_valid={cached_kv_valid}")
+
+        if cached_kv is not None and prefix_match_len > 0:
+            total_tokens = input_ids.size
+            try:
+                # Restore KV states for the matched prefix
+                for i, (layer_cache, cached_state) in enumerate(zip(prompt_cache, cached_kv)):
+                    if cached_state is not None:
+                        layer_cache.keys = cached_state[0]
+                        layer_cache.values = cached_state[1]
+                        if len(cached_state) > 2:
+                            layer_cache.offset = cached_state[2]
+
+                if prefix_match_len == total_tokens:
+                    # EXACT match - skip all prompt processing
+                    mm_cache_hit = True
+                    skip_prompt_processing = True
+                    if MULTIMODAL_KV_DEBUG:
+                        print(f"[DEBUG] EXACT HIT: {prefix_match_len} tokens matched")
+                else:
+                    # PREFIX match - we have cached KV for first N tokens
+                    # Need to process remaining tokens through language model only
+                    mm_prefix_hit = True
+                    if MULTIMODAL_KV_DEBUG:
+                        print(f"[DEBUG] PREFIX HIT: {prefix_match_len}/{total_tokens} tokens matched, {total_tokens - prefix_match_len} to process")
+
+            except Exception as e:
+                # If restoration fails, fall back to full forward pass
+                mm_cache_hit = False
+                mm_prefix_hit = False
+                prefix_match_len = 0
+                if MULTIMODAL_KV_DEBUG:
+                    print(f"[DEBUG] KV restoration FAILED: {e}")
+
+    # PREFIX CACHING: Handle different cache scenarios
+    if MULTIMODAL_KV_DEBUG:
+        print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}")
     if skip_prompt_processing and prompt_cache is not None:
-        # Cache hit - skip prompt processing, just get logits for last token
-        # The cache already contains KV states for all prompt tokens
+        # EXACT cache hit - skip all prompt processing, just get logits for last token
         last_token = input_ids[:, -1:]
-        # Filter kwargs - language_model doesn't accept all kwargs the full model does
         excluded_kwargs = {'temp', 'temperature', 'top_p', 'max_tokens', 'token_type_ids',
                           'pixel_values', 'image_sizes', 'attention_mask', 'position_ids'}
         lm_kwargs = {k: v for k, v in kwargs.items() if k not in excluded_kwargs}
@@ -343,13 +396,74 @@ def generate_step(
         quantize_cache_fn(prompt_cache)
         y, logprobs = sample(logits)
         mx.async_eval(y)
+
+    elif mm_prefix_hit and prefix_match_len > 0:
+        # PREFIX cache hit - KV states restored for first N tokens
+        # Process only the remaining tokens through language model
+        remaining_tokens = input_ids[:, prefix_match_len:]
+
+        if remaining_tokens.size > 0:
+            # Process remaining tokens through language model only (vision already encoded in cached KV)
+            excluded_kwargs = {'temp', 'temperature', 'top_p', 'max_tokens', 'token_type_ids',
+                              'pixel_values', 'image_sizes', 'attention_mask', 'position_ids'}
+            lm_kwargs = {k: v for k, v in kwargs.items() if k not in excluded_kwargs}
+
+            # Process all remaining tokens
+            outputs = model.language_model(
+                remaining_tokens,
+                cache=prompt_cache,
+                **lm_kwargs,
+            )
+            logits = outputs.logits[:, -1, :]
+            quantize_cache_fn(prompt_cache)
+            y, logprobs = sample(logits)
+            mx.async_eval(y)
+
+            # Cache the extended sequence for future use
+            if MULTIMODAL_KV_CACHE_ENABLED and mm_image_hash:
+                try:
+                    kv_states = []
+                    for layer_cache in prompt_cache:
+                        if hasattr(layer_cache, 'state') and layer_cache.state is not None:
+                            state = layer_cache.state
+                            mx.eval(state[0], state[1])
+                            kv_states.append((state[0], state[1], layer_cache.offset if hasattr(layer_cache, 'offset') else 0))
+                        else:
+                            kv_states.append(None)
+                    cache_multimodal_kv_prefix(mm_image_hash, input_ids, kv_states, input_ids.size)
+                except Exception:
+                    pass
+        else:
+            # No remaining tokens - just use cached logits (shouldn't happen normally)
+            outputs = model.language_model(input_ids[:, -1:], cache=prompt_cache)
+            logits = outputs.logits[:, -1, :]
+            y, logprobs = sample(logits)
+            mx.async_eval(y)
+
     else:
-        # Normal path - full forward pass with vision processing
+        # No cache hit - full forward pass with vision processing
         outputs = model(input_ids, pixel_values, cache=prompt_cache, mask=mask, **kwargs)
         logits = outputs.logits[:, -1, :]
         quantize_cache_fn(prompt_cache)
         y, logprobs = sample(logits)
         mx.async_eval(y)
+
+        # Cache KV states for future prefix matching
+        if MULTIMODAL_KV_CACHE_ENABLED and pixel_values is not None:
+            try:
+                if mm_image_hash is None:
+                    mm_image_hash = _get_image_hash(pixel_values)
+                kv_states = []
+                for layer_cache in prompt_cache:
+                    if hasattr(layer_cache, 'state') and layer_cache.state is not None:
+                        state = layer_cache.state
+                        mx.eval(state[0], state[1])
+                        kv_states.append((state[0], state[1], layer_cache.offset if hasattr(layer_cache, 'offset') else 0))
+                    else:
+                        kv_states.append(None)
+                cache_multimodal_kv_prefix(mm_image_hash, input_ids, kv_states, input_ids.size)
+            except Exception:
+                pass  # Silently fail caching - don't break generation
 
     if not skip_prompt_processing and outputs.cross_attention_states is not None:
         kwargs = {
@@ -974,6 +1088,7 @@ def batch_generate(
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
+    uniform_size: Optional[Tuple[int, int]] = None,
     **kwargs,
 ):
     """
@@ -1027,26 +1142,30 @@ def batch_generate(
         )
         return BatchResponse(texts, stats)
 
-    # Load and preprocess images
+    # Load and preprocess images (parallel for better TTFT)
     image_processor = (
         processor.image_processor if hasattr(processor, "image_processor") else None
     )
 
-    processed_images = []
-    image_sizes_original = []
-    for img in images:
-        if isinstance(img, str):
-            pil_img = process_image(img, None, image_processor)
-        elif isinstance(img, Image.Image):
-            pil_img = img
-        else:
-            pil_img = img
-        processed_images.append(pil_img)
-        # Track original size
-        if hasattr(pil_img, "height"):
-            image_sizes_original.append((pil_img.height, pil_img.width))
-        else:
-            image_sizes_original.append((0, 0))
+    # Extract resize_shape if provided (enables uniform batching for different-sized images)
+    resize_shape = kwargs.get("resize_shape", None)
+
+    # Use parallel loading for multiple images or I/O-bound operations
+    processed_images, image_sizes_original = load_images_parallel(
+        images,
+        image_processor=image_processor,
+        resize_shape=resize_shape,
+    )
+
+    # Force all images to uniform size for single-batch processing (may distort aspect ratio)
+    if uniform_size is not None:
+        from PIL import Image
+        processed_images = [
+            img.resize(uniform_size, Image.Resampling.LANCZOS) if img.size != uniform_size else img
+            for img in processed_images
+        ]
+        if verbose:
+            print(f"[batch_generate] Resized all images to uniform {uniform_size}")
 
     # Group images by shape for efficient processing (no padding within groups)
     if group_by_shape and len(processed_images) > 1:
@@ -1166,31 +1285,92 @@ def _generate_batch(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    inputs = prepare_inputs(
-        processor,
-        images=images,
-        audio=None,
-        prompts=formatted_prompts,
-        image_token_index=image_token_index,
-        resize_shape=resize_shape,
-        add_special_tokens=add_special_tokens,
-        pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
-    )
-    input_ids = inputs.get("input_ids", None)
-    pixel_values = inputs.get("pixel_values", None)
+    # Qwen3-VL has a processor bug where it counts image tokens across all prompts
+    # but image_grid_thw only has entries per image. Process inputs one at a time.
+    is_qwen3_vl = model.config.model_type in ["qwen3_vl", "qwen3_vl_moe"]
 
-    data_kwargs = {
-        k: v
-        for k, v in inputs.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
-    }
+    if is_qwen3_vl and images is not None and len(images) > 1:
+        # Process each image-prompt pair individually, then stack
+        all_inputs = []
+        for i in range(batch_size):
+            img = [images[i]] if i < len(images) else None
+            prompt = [formatted_prompts[i]]
+            inp = prepare_inputs(
+                processor,
+                images=img,
+                audio=None,
+                prompts=prompt,
+                image_token_index=image_token_index,
+                resize_shape=resize_shape,
+                add_special_tokens=add_special_tokens,
+                pad_to_uniform_size=False,
+            )
+            all_inputs.append(inp)
+
+        # Find max sequence length for padding
+        max_seq_len = max(inp["input_ids"].shape[-1] for inp in all_inputs)
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        # Stack inputs with padding
+        padded_input_ids = []
+        for inp in all_inputs:
+            ids = inp["input_ids"]
+            if ids.ndim == 1:
+                ids = ids[None, :]
+            seq_len = ids.shape[-1]
+            if seq_len < max_seq_len:
+                padding = mx.full((ids.shape[0], max_seq_len - seq_len), pad_token_id)
+                ids = mx.concatenate([ids, padding], axis=-1)
+            padded_input_ids.append(ids)
+
+        input_ids = mx.concatenate(padded_input_ids, axis=0)
+        pixel_values = mx.concatenate([inp["pixel_values"] for inp in all_inputs], axis=0)
+
+        # Merge data_kwargs from all inputs (take first non-None for each key)
+        data_kwargs = {}
+        for key in all_inputs[0].keys():
+            if key not in ["input_ids", "pixel_values", "attention_mask"]:
+                vals = [inp.get(key) for inp in all_inputs if inp.get(key) is not None]
+                if vals:
+                    if isinstance(vals[0], mx.array):
+                        data_kwargs[key] = mx.concatenate(vals, axis=0)
+                    else:
+                        data_kwargs[key] = vals[0]
+    else:
+        inputs = prepare_inputs(
+            processor,
+            images=images,
+            audio=None,
+            prompts=formatted_prompts,
+            image_token_index=image_token_index,
+            resize_shape=resize_shape,
+            add_special_tokens=add_special_tokens,
+            pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
+        )
+        input_ids = inputs.get("input_ids", None)
+        pixel_values = inputs.get("pixel_values", None)
+
+        data_kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
 
     # Use batch_size for prefill and completion to ensure consistent processing
+    # For Qwen3-VL with images, use large prefill_step_size to avoid chunking issues
+    # (chunked prefill causes RoPE position mismatch with image tokens)
+    gen_kwargs_extra = {}
+    if is_qwen3_vl and images is not None:
+        # Set prefill_step_size large enough to process entire sequence at once
+        seq_len = input_ids.shape[-1] if input_ids is not None else 32768
+        gen_kwargs_extra["prefill_step_size"] = max(seq_len + 1, 32768)
+
     gen = BatchGenerator(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
+        **gen_kwargs_extra,
         **kwargs,
     )
 
