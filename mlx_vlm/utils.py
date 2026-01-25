@@ -148,6 +148,7 @@ _multimodal_cache_last_access: float = 0.0  # Timestamp of last cache access
 # Hit/miss tracking for cache statistics
 _kv_cache_hits: int = 0
 _kv_cache_misses: int = 0
+_kv_cache_cross_image_hits: int = 0  # Hits from different image context (text prefix reuse)
 _kv_cache_tokens_matched: int = 0  # Total tokens served from cache
 _kv_cache_tokens_total: int = 0    # Total tokens requested
 
@@ -232,7 +233,7 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
         - num_matched_tokens: Number of tokens covered by the cache
         - image_hash: Hash of the image for caching new states
     """
-    global _kv_cache_hits, _kv_cache_misses, _kv_cache_tokens_matched, _kv_cache_tokens_total
+    global _kv_cache_hits, _kv_cache_misses, _kv_cache_cross_image_hits, _kv_cache_tokens_matched, _kv_cache_tokens_total
 
     if not MULTIMODAL_KV_CACHE_ENABLED:
         return None, 0, ""
@@ -251,33 +252,54 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
     # Track total tokens requested
     _kv_cache_tokens_total += len(token_list)
 
-    # Check if we have any cached entries for this image
-    if image_hash not in _multimodal_prefix_cache:
-        if MULTIMODAL_KV_DEBUG:
-            print(f"[DEBUG] KV Cache MISS: no entries for image hash {image_hash[:8]}")
-        _kv_cache_misses += 1
-        return None, 0, image_hash
+    # First, try exact image hash match (fast path)
+    kv_states, match_len, entry_idx = None, 0, -1
+    matched_hash = image_hash
 
-    # Find longest matching prefix
-    cached_entries = _multimodal_prefix_cache[image_hash]
-    if MULTIMODAL_KV_DEBUG:
-        print(f"[DEBUG] KV Cache lookup: image={image_hash[:8]}, query_len={len(token_list)}, num_entries={len(cached_entries)}")
-    kv_states, match_len, entry_idx = _find_longest_prefix_match(token_list, cached_entries)
+    if image_hash in _multimodal_prefix_cache:
+        cached_entries = _multimodal_prefix_cache[image_hash]
+        if MULTIMODAL_KV_DEBUG:
+            print(f"[DEBUG] KV Cache lookup (exact): image={image_hash[:8]}, query_len={len(token_list)}, num_entries={len(cached_entries)}")
+        kv_states, match_len, entry_idx = _find_longest_prefix_match(token_list, cached_entries)
+
+    # If no exact match, search ALL cached entries for longest token prefix match
+    # This allows reusing text prefix KV states even when images change
+    if kv_states is None and len(_multimodal_prefix_cache) > 0:
+        if MULTIMODAL_KV_DEBUG:
+            print(f"[DEBUG] KV Cache: no exact image match, searching across {len(_multimodal_prefix_cache)} image hashes...")
+
+        best_cross_match = (None, 0, -1, None)  # (kv_states, match_len, entry_idx, source_hash)
+
+        for other_hash, other_entries in _multimodal_prefix_cache.items():
+            if other_hash == image_hash:
+                continue  # Already checked
+            cross_kv, cross_len, cross_idx = _find_longest_prefix_match(token_list, other_entries)
+            if cross_len > best_cross_match[1]:
+                best_cross_match = (cross_kv, cross_len, cross_idx, other_hash)
+
+        if best_cross_match[0] is not None:
+            kv_states, match_len, entry_idx, matched_hash = best_cross_match
+            if MULTIMODAL_KV_DEBUG:
+                print(f"[DEBUG] KV Cache CROSS-IMAGE HIT: matched {match_len} tokens from image hash {matched_hash[:8]}")
 
     if kv_states is not None:
-        # Update LRU order
-        if image_hash in _multimodal_cache_access_order:
-            _multimodal_cache_access_order.remove(image_hash)
-        _multimodal_cache_access_order.append(image_hash)
+        # Update LRU order for the matched hash
+        if matched_hash in _multimodal_cache_access_order:
+            _multimodal_cache_access_order.remove(matched_hash)
+        _multimodal_cache_access_order.append(matched_hash)
         # Track hit and tokens matched
         _kv_cache_hits += 1
         _kv_cache_tokens_matched += match_len
-        if MULTIMODAL_KV_DEBUG:
+        if matched_hash != image_hash:
+            _kv_cache_cross_image_hits += 1
+            if MULTIMODAL_KV_DEBUG:
+                print(f"[DEBUG] KV Cache CROSS-IMAGE HIT: reusing {match_len} tokens from different image context")
+        elif MULTIMODAL_KV_DEBUG:
             print(f"[DEBUG] KV Cache HIT: matched {match_len} tokens")
     else:
         _kv_cache_misses += 1
         if MULTIMODAL_KV_DEBUG:
-            print(f"[DEBUG] KV Cache MISS: no prefix match found")
+            print(f"[DEBUG] KV Cache MISS: no prefix match found across {len(_multimodal_prefix_cache)} image hashes")
 
     return kv_states, match_len, image_hash
 
@@ -345,12 +367,13 @@ def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens
 def clear_multimodal_kv_cache():
     """Clear all cached multimodal KV states."""
     global _multimodal_prefix_cache, _multimodal_cache_access_order, _multimodal_cache_last_access
-    global _kv_cache_hits, _kv_cache_misses, _kv_cache_tokens_matched, _kv_cache_tokens_total
+    global _kv_cache_hits, _kv_cache_misses, _kv_cache_cross_image_hits, _kv_cache_tokens_matched, _kv_cache_tokens_total
     _multimodal_prefix_cache.clear()
     _multimodal_cache_access_order.clear()
     _multimodal_cache_last_access = 0.0
     _kv_cache_hits = 0
     _kv_cache_misses = 0
+    _kv_cache_cross_image_hits = 0
     _kv_cache_tokens_matched = 0
     _kv_cache_tokens_total = 0
 
@@ -383,6 +406,7 @@ def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
         # Hit/miss tracking
         "hits": _kv_cache_hits,
         "misses": _kv_cache_misses,
+        "cross_image_hits": _kv_cache_cross_image_hits,
         "hit_rate": round(hit_rate, 1),
         "tokens_matched": _kv_cache_tokens_matched,
         "tokens_total": _kv_cache_tokens_total,
