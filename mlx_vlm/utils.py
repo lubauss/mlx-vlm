@@ -1913,34 +1913,40 @@ def prepare_inputs(
 
         # For Qwen2VL/3VL processors, apply chat template to format prompts correctly
         # These processors expect <|vision_start|><|image_pad|><|vision_end|> format
+        # Skip if prompt is already templated (e.g., when called from server which applies its own template)
         formatted_prompts = prompts
         if is_qwen_vl_processor and hasattr(processor, 'apply_chat_template'):
-            num_images = len(images) if images else 0
-            # Build messages in the format expected by Qwen VL chat template
-            if not isinstance(prompts, list):
-                prompts_list = [prompts]
-            else:
-                prompts_list = prompts
+            # Check if prompt is already chat-templated (contains Qwen VL markers)
+            prompts_check = prompts if isinstance(prompts, str) else prompts[0] if prompts else ""
+            already_templated = "<|vision_start|>" in prompts_check or "<|im_start|>" in prompts_check
 
-            formatted_prompts = []
-            for p in prompts_list:
-                messages = [{'role': 'user', 'content': []}]
-                # Add image placeholders
-                for _ in range(num_images):
-                    messages[0]['content'].append({'type': 'image'})
-                messages[0]['content'].append({'type': 'text', 'text': p})
+            if not already_templated:
+                num_images = len(images) if images else 0
+                # Build messages in the format expected by Qwen VL chat template
+                if not isinstance(prompts, list):
+                    prompts_list = [prompts]
+                else:
+                    prompts_list = prompts
 
-                try:
-                    formatted = processor.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                    formatted_prompts.append(formatted)
-                except Exception:
-                    # Fallback to original prompt if chat template fails
-                    formatted_prompts.append(p)
+                formatted_prompts = []
+                for p in prompts_list:
+                    messages = [{'role': 'user', 'content': []}]
+                    # Add image placeholders
+                    for _ in range(num_images):
+                        messages[0]['content'].append({'type': 'image'})
+                    messages[0]['content'].append({'type': 'text', 'text': p})
 
-            if not isinstance(prompts, list):
-                formatted_prompts = formatted_prompts[0]
+                    try:
+                        formatted = processor.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True
+                        )
+                        formatted_prompts.append(formatted)
+                    except Exception:
+                        # Fallback to original prompt if chat template fails
+                        formatted_prompts.append(p)
+
+                if not isinstance(prompts, list):
+                    formatted_prompts = formatted_prompts[0]
 
         inputs = process_inputs_with_fallback(
             processor,
