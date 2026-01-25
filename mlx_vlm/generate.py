@@ -335,52 +335,68 @@ def generate_step(
     # F10 v3: Check multimodal KV cache with PREFIX MATCHING
     mm_cache_hit = False
     mm_prefix_hit = False
+    mm_cross_image_hit = False  # Cross-image match with selective layer recomputation
     mm_image_hash = None
     prefix_match_len = 0
 
     if MULTIMODAL_KV_CACHE_ENABLED and pixel_values is not None and not skip_prompt_processing:
         cached_kv, prefix_match_len, mm_image_hash = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
 
+        # Check if this is a cross-image match (partial KV - some layers are None)
+        is_partial_kv = cached_kv is not None and any(kv is None for kv in cached_kv)
+
         # Debug output
         if MULTIMODAL_KV_DEBUG:
             cached_kv_valid = cached_kv is not None and all(kv is not None for kv in cached_kv[:3] if cached_kv)
-            print(f"[DEBUG] generate_step: cached_kv={cached_kv is not None}, prefix_match_len={prefix_match_len}, kv_valid={cached_kv_valid}")
+            print(f"[DEBUG] generate_step: cached_kv={cached_kv is not None}, prefix_match_len={prefix_match_len}, kv_valid={cached_kv_valid}, is_partial={is_partial_kv}")
 
         if cached_kv is not None and prefix_match_len > 0:
             total_tokens = input_ids.size
-            try:
-                # Restore KV states for the matched prefix
-                for i, (layer_cache, cached_state) in enumerate(zip(prompt_cache, cached_kv)):
-                    if cached_state is not None:
-                        layer_cache.keys = cached_state[0]
-                        layer_cache.values = cached_state[1]
-                        if len(cached_state) > 2:
-                            layer_cache.offset = cached_state[2]
 
-                if prefix_match_len == total_tokens:
-                    # EXACT match - skip all prompt processing
-                    mm_cache_hit = True
-                    skip_prompt_processing = True
-                    if MULTIMODAL_KV_DEBUG:
-                        print(f"[DEBUG] EXACT HIT: {prefix_match_len} tokens matched")
-                else:
-                    # PREFIX match - we have cached KV for first N tokens
-                    # Need to process remaining tokens through language model only
-                    mm_prefix_hit = True
-                    if MULTIMODAL_KV_DEBUG:
-                        print(f"[DEBUG] PREFIX HIT: {prefix_match_len}/{total_tokens} tokens matched, {total_tokens - prefix_match_len} to process")
-
-            except Exception as e:
-                # If restoration fails, fall back to full forward pass
-                mm_cache_hit = False
-                mm_prefix_hit = False
-                prefix_match_len = 0
+            # For cross-image matches (partial KV), we DON'T restore cache
+            # Instead, we'll do a full forward pass with new images
+            # The model will compute fresh KV for all layers including new image tokens
+            if is_partial_kv:
+                mm_cross_image_hit = True
                 if MULTIMODAL_KV_DEBUG:
-                    print(f"[DEBUG] KV restoration FAILED: {e}")
+                    n_cached = sum(1 for kv in cached_kv if kv is not None)
+                    print(f"[DEBUG] CROSS-IMAGE MATCH: {n_cached}/{len(cached_kv)} layers cached, will do full forward pass with new images")
+                # Don't restore partial KV - do full forward pass instead
+            else:
+                # Full KV match - safe to restore all layers
+                try:
+                    # Restore KV states for the matched prefix
+                    for i, (layer_cache, cached_state) in enumerate(zip(prompt_cache, cached_kv)):
+                        if cached_state is not None:
+                            layer_cache.keys = cached_state[0]
+                            layer_cache.values = cached_state[1]
+                            if len(cached_state) > 2:
+                                layer_cache.offset = cached_state[2]
+
+                    if prefix_match_len == total_tokens:
+                        # EXACT match - skip all prompt processing
+                        mm_cache_hit = True
+                        skip_prompt_processing = True
+                        if MULTIMODAL_KV_DEBUG:
+                            print(f"[DEBUG] EXACT HIT: {prefix_match_len} tokens matched")
+                    else:
+                        # PREFIX match - we have cached KV for first N tokens
+                        # Need to process remaining tokens through language model only
+                        mm_prefix_hit = True
+                        if MULTIMODAL_KV_DEBUG:
+                            print(f"[DEBUG] PREFIX HIT: {prefix_match_len}/{total_tokens} tokens matched, {total_tokens - prefix_match_len} to process")
+
+                except Exception as e:
+                    # If restoration fails, fall back to full forward pass
+                    mm_cache_hit = False
+                    mm_prefix_hit = False
+                    prefix_match_len = 0
+                    if MULTIMODAL_KV_DEBUG:
+                        print(f"[DEBUG] KV restoration FAILED: {e}")
 
     # PREFIX CACHING: Handle different cache scenarios
     if MULTIMODAL_KV_DEBUG:
-        print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}")
+        print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}, mm_cross_image={mm_cross_image_hit}")
     if skip_prompt_processing and prompt_cache is not None:
         # EXACT cache hit - skip all prompt processing, just get logits for last token
         last_token = input_ids[:, -1:]
