@@ -339,6 +339,7 @@ def generate_step(
     mm_cross_image_hit = False  # Cross-image match with selective layer recomputation
     mm_image_hash = None
     prefix_match_len = 0
+    staged_forward_info = None  # Info for staged forward pass (cross-image)
 
     if MULTIMODAL_KV_CACHE_ENABLED and pixel_values is not None and not skip_prompt_processing:
         cached_kv, prefix_match_len, mm_image_hash = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
@@ -354,24 +355,24 @@ def generate_step(
         if cached_kv is not None and prefix_match_len > 0:
             total_tokens = input_ids.size
 
-            # For cross-image matches (partial KV), we detect but DON'T restore partial cache
-            # Reason: Restoring partial cache causes offset mismatch with full forward pass
-            # The model expects either full cache (skip tokens) or no cache (process all)
-            # Partial restore (some layers cached, some not) creates computation conflicts
+            # For cross-image matches, we CANNOT use layer-based selective recomputation.
+            # REASON: Cached KV in ALL layers contains image-dependent representations.
+            # Even if we recompute layers 0-7 with new images, layers 8+ cached KV
+            # still "remembers" the old images through attention.
             #
-            # Future optimization: Implement true selective layer recomputation where
-            # we can process the prompt in two stages:
-            # 1. Layers 0-7: full forward pass with new images
-            # 2. Layers 8+: use cached KV and only process new token positions
-            # This requires deeper model architecture changes.
+            # Experiment (Jan 25, 2026): Staged forward pass achieved 24% speedup (9.8s vs 13s)
+            # but model hallucinated old images (Hindu deities instead of cats).
+            #
+            # CONCLUSION: Option 1 (layer-based) doesn't work for cross-image.
+            # Need Option 2 (position-based) or full forward pass.
             if is_partial_kv:
                 mm_cross_image_hit = True
                 if MULTIMODAL_KV_DEBUG:
                     n_cached = sum(1 for kv in cached_kv if kv is not None)
-                    print(f"[DEBUG] CROSS-IMAGE DETECTED: {n_cached}/{len(cached_kv)} layers could be reused")
-                    print(f"[DEBUG]   Currently falling back to full forward pass for accuracy")
-                    print(f"[DEBUG]   TODO: Implement staged forward pass for {VISION_CRITICAL_LAYERS} vision-critical layers")
-                # Don't restore partial cache - do clean full forward pass
+                    print(f"[DEBUG] CROSS-IMAGE DETECTED: {n_cached}/{len(cached_kv)} layers")
+                    print(f"[DEBUG]   Layer-based recomputation DISABLED (causes hallucination)")
+                    print(f"[DEBUG]   Falling back to full forward pass for accuracy")
+                # Don't use staged forward - fall back to full forward pass
             else:
                 # Full KV match - safe to restore all layers
                 try:
