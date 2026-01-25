@@ -145,6 +145,12 @@ _multimodal_prefix_cache: Dict[str, List[Tuple[List[int], Any, int]]] = {}
 _multimodal_cache_access_order: List[str] = []  # Track image_hash access for LRU
 _multimodal_cache_last_access: float = 0.0  # Timestamp of last cache access
 
+# Hit/miss tracking for cache statistics
+_kv_cache_hits: int = 0
+_kv_cache_misses: int = 0
+_kv_cache_tokens_matched: int = 0  # Total tokens served from cache
+_kv_cache_tokens_total: int = 0    # Total tokens requested
+
 
 def _check_cache_ttl():
     """Check if cache has expired due to inactivity and clear if needed."""
@@ -226,6 +232,8 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
         - num_matched_tokens: Number of tokens covered by the cache
         - image_hash: Hash of the image for caching new states
     """
+    global _kv_cache_hits, _kv_cache_misses, _kv_cache_tokens_matched, _kv_cache_tokens_total
+
     if not MULTIMODAL_KV_CACHE_ENABLED:
         return None, 0, ""
 
@@ -240,10 +248,14 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
     else:
         token_list = list(input_ids.reshape(-1))
 
+    # Track total tokens requested
+    _kv_cache_tokens_total += len(token_list)
+
     # Check if we have any cached entries for this image
     if image_hash not in _multimodal_prefix_cache:
         if MULTIMODAL_KV_DEBUG:
             print(f"[DEBUG] KV Cache MISS: no entries for image hash {image_hash[:8]}")
+        _kv_cache_misses += 1
         return None, 0, image_hash
 
     # Find longest matching prefix
@@ -257,6 +269,15 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
         if image_hash in _multimodal_cache_access_order:
             _multimodal_cache_access_order.remove(image_hash)
         _multimodal_cache_access_order.append(image_hash)
+        # Track hit and tokens matched
+        _kv_cache_hits += 1
+        _kv_cache_tokens_matched += match_len
+        if MULTIMODAL_KV_DEBUG:
+            print(f"[DEBUG] KV Cache HIT: matched {match_len} tokens")
+    else:
+        _kv_cache_misses += 1
+        if MULTIMODAL_KV_DEBUG:
+            print(f"[DEBUG] KV Cache MISS: no prefix match found")
 
     return kv_states, match_len, image_hash
 
@@ -324,9 +345,14 @@ def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens
 def clear_multimodal_kv_cache():
     """Clear all cached multimodal KV states."""
     global _multimodal_prefix_cache, _multimodal_cache_access_order, _multimodal_cache_last_access
+    global _kv_cache_hits, _kv_cache_misses, _kv_cache_tokens_matched, _kv_cache_tokens_total
     _multimodal_prefix_cache.clear()
     _multimodal_cache_access_order.clear()
     _multimodal_cache_last_access = 0.0
+    _kv_cache_hits = 0
+    _kv_cache_misses = 0
+    _kv_cache_tokens_matched = 0
+    _kv_cache_tokens_total = 0
 
 
 def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
@@ -341,6 +367,11 @@ def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
     else:
         ttl_remaining = None
 
+    # Calculate hit rate
+    total_lookups = _kv_cache_hits + _kv_cache_misses
+    hit_rate = (_kv_cache_hits / total_lookups * 100) if total_lookups > 0 else 0.0
+    token_reuse_rate = (_kv_cache_tokens_matched / _kv_cache_tokens_total * 100) if _kv_cache_tokens_total > 0 else 0.0
+
     return {
         "enabled": MULTIMODAL_KV_CACHE_ENABLED,
         "num_images": len(_multimodal_prefix_cache),
@@ -349,6 +380,13 @@ def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
         "ttl_seconds": "disabled" if MULTIMODAL_KV_CACHE_TTL_SECONDS <= 0 else MULTIMODAL_KV_CACHE_TTL_SECONDS,
         "ttl_remaining": ttl_remaining,
         "image_hashes": list(_multimodal_prefix_cache.keys()),
+        # Hit/miss tracking
+        "hits": _kv_cache_hits,
+        "misses": _kv_cache_misses,
+        "hit_rate": round(hit_rate, 1),
+        "tokens_matched": _kv_cache_tokens_matched,
+        "tokens_total": _kv_cache_tokens_total,
+        "token_reuse_rate": round(token_reuse_rate, 1),
     }
 
 
@@ -473,9 +511,12 @@ def cache_pixel_values(source: str, pixel_values: Any, original_size: Tuple[int,
 def clear_pixel_values_cache():
     """Clear all cached pixel values and PIL images."""
     global _pixel_values_cache, _pixel_values_cache_order, _pil_image_cache
+    global _pil_cache_hits, _pil_cache_misses
     _pixel_values_cache.clear()
     _pixel_values_cache_order.clear()
     _pil_image_cache.clear()
+    _pil_cache_hits = 0
+    _pil_cache_misses = 0
     if PIXEL_VALUES_CACHE_DEBUG:
         print("[PIXEL CACHE] CLEARED (pixel_values + PIL images)")
 
@@ -505,6 +546,20 @@ def get_pixel_values_cache_stats() -> Dict[str, Any]:
         "max_size": PIXEL_VALUES_CACHE_MAX_SIZE,
         "ttl_seconds": PIXEL_VALUES_CACHE_TTL_SECONDS,
         "entries": entries_info,
+    }
+
+
+def get_pil_cache_stats() -> Dict[str, Any]:
+    """Get PIL image cache statistics."""
+    total_lookups = _pil_cache_hits + _pil_cache_misses
+    hit_rate = (_pil_cache_hits / total_lookups * 100) if total_lookups > 0 else 0.0
+
+    return {
+        "size": len(_pil_image_cache),
+        "max_size": _pil_image_cache_max_size,
+        "hits": _pil_cache_hits,
+        "misses": _pil_cache_misses,
+        "hit_rate": round(hit_rate, 1),
     }
 
 
@@ -1148,6 +1203,8 @@ def save_config(
 # PIL Image Cache (for skipping disk/network I/O on repeated requests)
 _pil_image_cache: Dict[str, Image.Image] = {}
 _pil_image_cache_max_size = 20  # Keep 20 most recent images
+_pil_cache_hits: int = 0
+_pil_cache_misses: int = 0
 
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
@@ -1155,6 +1212,8 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     Helper function to load an image from either a URL or file.
     Caches PIL images to skip disk/network I/O on repeated requests.
     """
+    global _pil_cache_hits, _pil_cache_misses
+
     # Check PIL image cache for string sources
     cache_key = None
     if isinstance(image_source, str) and PIXEL_VALUES_CACHE_ENABLED:
@@ -1162,6 +1221,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
         if cache_key in _pil_image_cache:
             if PIXEL_VALUES_CACHE_DEBUG:
                 print(f"[PIL CACHE] HIT: {cache_key[:8]}...")
+            _pil_cache_hits += 1
             # Return a copy to avoid mutations
             return _pil_image_cache[cache_key].copy()
 
@@ -1207,6 +1267,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
     # Cache PIL image for future requests
     if cache_key is not None and PIXEL_VALUES_CACHE_ENABLED:
+        _pil_cache_misses += 1  # Track miss (we loaded fresh)
         # LRU eviction
         while len(_pil_image_cache) >= _pil_image_cache_max_size:
             oldest_key = next(iter(_pil_image_cache))
