@@ -1846,9 +1846,20 @@ def prepare_inputs(
 
     model_inputs = {}
 
+    # Check if processor is Qwen2VL/Qwen3VL type which uses a different image placeholder format
+    # These processors have their own image token insertion logic and should use process_inputs_with_fallback
+    processor_class_name = processor.__class__.__name__.lower()
+    is_qwen_vl_processor = "qwen2vl" in processor_class_name or "qwen3vl" in processor_class_name
+
+    # Check if prompts use <image> placeholder format
+    prompts_list = [prompts] if not isinstance(prompts, list) else prompts
+    uses_image_placeholder = any("<image>" in p for p in prompts_list) if prompts_list else False
+
     if hasattr(processor, "image_processor") and isinstance(
         processor.image_processor, BaseImageProcessor
-    ):
+    ) and uses_image_placeholder and not is_qwen_vl_processor:
+        # This path is for processors that use <image> as the image placeholder
+        # Qwen2VL/3VL and similar models use different format and should use process_inputs_with_fallback
         if not isinstance(prompts, list):
             prompts = [prompts]
 
@@ -1900,11 +1911,42 @@ def prepare_inputs(
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        # For Qwen2VL/3VL processors, apply chat template to format prompts correctly
+        # These processors expect <|vision_start|><|image_pad|><|vision_end|> format
+        formatted_prompts = prompts
+        if is_qwen_vl_processor and hasattr(processor, 'apply_chat_template'):
+            num_images = len(images) if images else 0
+            # Build messages in the format expected by Qwen VL chat template
+            if not isinstance(prompts, list):
+                prompts_list = [prompts]
+            else:
+                prompts_list = prompts
+
+            formatted_prompts = []
+            for p in prompts_list:
+                messages = [{'role': 'user', 'content': []}]
+                # Add image placeholders
+                for _ in range(num_images):
+                    messages[0]['content'].append({'type': 'image'})
+                messages[0]['content'].append({'type': 'text', 'text': p})
+
+                try:
+                    formatted = processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    formatted_prompts.append(formatted)
+                except Exception:
+                    # Fallback to original prompt if chat template fails
+                    formatted_prompts.append(p)
+
+            if not isinstance(prompts, list):
+                formatted_prompts = formatted_prompts[0]
+
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
             audio=audio,
-            prompts=prompts,
+            prompts=formatted_prompts,
             add_special_tokens=add_special_tokens,
             **kwargs,
         )
