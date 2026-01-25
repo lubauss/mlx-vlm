@@ -352,6 +352,162 @@ def get_multimodal_kv_cache_stats() -> Dict[str, Any]:
     }
 
 
+# =============================================================================
+# Pixel Values Preprocessing Cache (Production Caching - Option 1)
+# =============================================================================
+# Caches the preprocessed pixel_values tensor to skip image loading/preprocessing
+# on repeated requests with the same image. This addresses the gap where image
+# preprocessing (~30-60ms) runs on every request even with KV caching.
+#
+# Key insight: Cloud APIs (Claude Files API, OpenAI) separate "upload/preprocess"
+# from "use in conversation". This cache provides similar benefits locally.
+
+PIXEL_VALUES_CACHE_ENABLED = True
+PIXEL_VALUES_CACHE_MAX_SIZE = 50  # Cache up to 50 different images
+PIXEL_VALUES_CACHE_TTL_SECONDS = 300  # 5 minutes TTL (0 = no expiry)
+PIXEL_VALUES_CACHE_DEBUG = False  # Set True to enable debug logging for cache operations
+
+# Cache structure: {source_hash: (pixel_values, timestamp, original_size)}
+_pixel_values_cache: Dict[str, Tuple[Any, float, Tuple[int, int]]] = {}
+_pixel_values_cache_order: List[str] = []  # LRU order
+
+# PIL Image Cache (forward declaration, used in load_image)
+_pil_image_cache: Dict[str, Any] = {}  # source_hash -> PIL Image
+
+
+def _hash_image_source(source: str) -> str:
+    """
+    Hash an image source (path, URL, or base64) for cache lookup.
+
+    For base64: Use first 2000 chars (enough for uniqueness, fast to hash)
+    For paths/URLs: Hash the full string
+    """
+    import hashlib
+    if len(source) > 2000:
+        # Base64 or very long URL - hash prefix
+        return hashlib.md5(source[:2000].encode()).hexdigest()
+    return hashlib.md5(source.encode()).hexdigest()
+
+
+def get_cached_pixel_values(source: str) -> Optional[Tuple[Any, Tuple[int, int]]]:
+    """
+    Get cached preprocessed pixel_values if available.
+
+    Args:
+        source: Image source (file path, URL, or base64 string)
+
+    Returns:
+        Tuple of (pixel_values, original_size) if cached, None otherwise
+    """
+    if not PIXEL_VALUES_CACHE_ENABLED:
+        return None
+
+    import time
+    cache_key = _hash_image_source(source)
+
+    if cache_key not in _pixel_values_cache:
+        if PIXEL_VALUES_CACHE_DEBUG:
+            print(f"[PIXEL CACHE] MISS: {cache_key[:8]}... (source: {source[:50]}...)")
+        return None
+
+    pixel_values, timestamp, original_size = _pixel_values_cache[cache_key]
+
+    # Check TTL
+    if PIXEL_VALUES_CACHE_TTL_SECONDS > 0:
+        elapsed = time.time() - timestamp
+        if elapsed > PIXEL_VALUES_CACHE_TTL_SECONDS:
+            # Expired - remove from cache
+            _pixel_values_cache.pop(cache_key, None)
+            if cache_key in _pixel_values_cache_order:
+                _pixel_values_cache_order.remove(cache_key)
+            if PIXEL_VALUES_CACHE_DEBUG:
+                print(f"[PIXEL CACHE] EXPIRED: {cache_key[:8]}... (elapsed: {elapsed:.1f}s)")
+            return None
+
+    # LRU update
+    if cache_key in _pixel_values_cache_order:
+        _pixel_values_cache_order.remove(cache_key)
+    _pixel_values_cache_order.append(cache_key)
+
+    if PIXEL_VALUES_CACHE_DEBUG:
+        print(f"[PIXEL CACHE] HIT: {cache_key[:8]}... (size: {original_size})")
+
+    return pixel_values, original_size
+
+
+def cache_pixel_values(source: str, pixel_values: Any, original_size: Tuple[int, int]):
+    """
+    Cache preprocessed pixel_values for an image source.
+
+    Args:
+        source: Image source (file path, URL, or base64 string)
+        pixel_values: Preprocessed pixel values tensor
+        original_size: Original image size (height, width)
+    """
+    if not PIXEL_VALUES_CACHE_ENABLED:
+        return
+
+    import time
+    cache_key = _hash_image_source(source)
+
+    # LRU eviction if at capacity
+    while PIXEL_VALUES_CACHE_MAX_SIZE > 0 and len(_pixel_values_cache) >= PIXEL_VALUES_CACHE_MAX_SIZE:
+        if _pixel_values_cache_order:
+            oldest = _pixel_values_cache_order.pop(0)
+            _pixel_values_cache.pop(oldest, None)
+            if PIXEL_VALUES_CACHE_DEBUG:
+                print(f"[PIXEL CACHE] EVICT: {oldest[:8]}...")
+        else:
+            break
+
+    # Evaluate tensor before caching (break computation graph)
+    mx.eval(pixel_values)
+
+    _pixel_values_cache[cache_key] = (pixel_values, time.time(), original_size)
+    _pixel_values_cache_order.append(cache_key)
+
+    if PIXEL_VALUES_CACHE_DEBUG:
+        print(f"[PIXEL CACHE] STORE: {cache_key[:8]}... (size: {original_size}, shape: {pixel_values.shape})")
+
+
+def clear_pixel_values_cache():
+    """Clear all cached pixel values and PIL images."""
+    global _pixel_values_cache, _pixel_values_cache_order, _pil_image_cache
+    _pixel_values_cache.clear()
+    _pixel_values_cache_order.clear()
+    _pil_image_cache.clear()
+    if PIXEL_VALUES_CACHE_DEBUG:
+        print("[PIXEL CACHE] CLEARED (pixel_values + PIL images)")
+
+
+def get_pixel_values_cache_stats() -> Dict[str, Any]:
+    """Get pixel values cache statistics."""
+    import time
+
+    # Calculate TTL remaining for each entry
+    entries_info = []
+    current_time = time.time()
+    for key, (pv, timestamp, size) in _pixel_values_cache.items():
+        if PIXEL_VALUES_CACHE_TTL_SECONDS > 0:
+            ttl_remaining = max(0, PIXEL_VALUES_CACHE_TTL_SECONDS - (current_time - timestamp))
+        else:
+            ttl_remaining = None
+        entries_info.append({
+            "key": key[:8],
+            "size": size,
+            "shape": tuple(pv.shape) if hasattr(pv, 'shape') else None,
+            "ttl_remaining": ttl_remaining,
+        })
+
+    return {
+        "enabled": PIXEL_VALUES_CACHE_ENABLED,
+        "size": len(_pixel_values_cache),
+        "max_size": PIXEL_VALUES_CACHE_MAX_SIZE,
+        "ttl_seconds": PIXEL_VALUES_CACHE_TTL_SECONDS,
+        "entries": entries_info,
+    }
+
+
 # Legacy compatibility - keep old functions working
 def _hash_multimodal_input(pixel_values, input_ids) -> str:
     """Legacy: Create a hash key for exact match (deprecated, use prefix matching)."""
@@ -989,10 +1145,26 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
+# PIL Image Cache (for skipping disk/network I/O on repeated requests)
+_pil_image_cache: Dict[str, Image.Image] = {}
+_pil_image_cache_max_size = 20  # Keep 20 most recent images
+
+
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     Helper function to load an image from either a URL or file.
+    Caches PIL images to skip disk/network I/O on repeated requests.
     """
+    # Check PIL image cache for string sources
+    cache_key = None
+    if isinstance(image_source, str) and PIXEL_VALUES_CACHE_ENABLED:
+        cache_key = _hash_image_source(image_source)
+        if cache_key in _pil_image_cache:
+            if PIXEL_VALUES_CACHE_DEBUG:
+                print(f"[PIL CACHE] HIT: {cache_key[:8]}...")
+            # Return a copy to avoid mutations
+            return _pil_image_cache[cache_key].copy()
+
     if (
         isinstance(image_source, BytesIO)
         or (isinstance(image_source, str) and image_source.startswith("data:image/"))
@@ -1032,6 +1204,17 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
     image = ImageOps.exif_transpose(image)
     image = image.convert("RGB")
+
+    # Cache PIL image for future requests
+    if cache_key is not None and PIXEL_VALUES_CACHE_ENABLED:
+        # LRU eviction
+        while len(_pil_image_cache) >= _pil_image_cache_max_size:
+            oldest_key = next(iter(_pil_image_cache))
+            del _pil_image_cache[oldest_key]
+        _pil_image_cache[cache_key] = image.copy()
+        if PIXEL_VALUES_CACHE_DEBUG:
+            print(f"[PIL CACHE] STORE: {cache_key[:8]}... (size: {image.size})")
+
     return image
 
 
@@ -1338,15 +1521,49 @@ def prepare_inputs(
         }
 
     # Process images
+    original_image_sources = None  # Track for pixel values caching
     if images is not None:
         if not isinstance(images, list):
             images = [images]
 
+        # Save original sources for pixel values caching (before they become PIL images)
+        original_image_sources = [
+            img if isinstance(img, str) else None
+            for img in images
+        ]
+
+        # Check pixel values cache BEFORE loading images (Production Caching Option 1)
+        # This can skip expensive image loading entirely on cache hits
+        cached_pixel_values_early = None
+        can_use_early_cache = (
+            PIXEL_VALUES_CACHE_ENABLED
+            and original_image_sources
+            and all(src is not None for src in original_image_sources)
+            and len(original_image_sources) == 1
+            # Only skip loading for BaseImageProcessor path (detected by checking processor type)
+            and hasattr(processor, "image_processor")
+            and isinstance(processor.image_processor, BaseImageProcessor)
+        )
+
+        if can_use_early_cache:
+            cached = get_cached_pixel_values(original_image_sources[0])
+            if cached is not None:
+                cached_pixel_values_early, _ = cached
+                if PIXEL_VALUES_CACHE_DEBUG:
+                    print(f"[PIXEL CACHE] EARLY HIT - skipping image loading")
+
         image_processor = (
             processor.image_processor if hasattr(processor, "image_processor") else None
         )
-        # Use parallel loading for TTFT improvement (F3 optimization)
-        images, _ = load_images_parallel(images, image_processor, resize_shape)
+
+        # Skip image loading if we have cached pixel_values (only for BaseImageProcessor path)
+        if cached_pixel_values_early is None:
+            # Use parallel loading for TTFT improvement (F3 optimization)
+            images, _ = load_images_parallel(images, image_processor, resize_shape)
+        else:
+            # We have cached pixel_values, but still need a placeholder for control flow
+            # The actual pixel_values will be injected later
+            images = [None]  # Placeholder
 
         # For batching, we need uniform image sizes. Instead of padding to the
         # largest image (which adds white borders that hurt accuracy), we resize
@@ -1482,8 +1699,26 @@ def prepare_inputs(
             input_ids.append(mx.array(ids + padding))
 
         model_inputs["input_ids"] = mx.array(input_ids)
-        pixel_values = processor.image_processor.preprocess(images=images)
-        model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
+
+        # Use early cached pixel_values if available (skipped image loading)
+        if cached_pixel_values_early is not None:
+            # Cache HIT - use cached pixel_values, already skipped image loading
+            model_inputs["pixel_values"] = cached_pixel_values_early
+        else:
+            # Cache MISS - preprocess and cache
+            pixel_values = processor.image_processor.preprocess(images=images)
+            model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
+
+            # Cache the result for future requests
+            if (
+                PIXEL_VALUES_CACHE_ENABLED
+                and original_image_sources
+                and all(src is not None for src in original_image_sources)
+                and len(original_image_sources) == 1
+            ):
+                original_size = (images[0].height, images[0].width) if hasattr(images[0], 'height') else (0, 0)
+                cache_pixel_values(original_image_sources[0], model_inputs["pixel_values"], original_size)
+
         model_inputs["attention_mask"] = mx.array(
             [(ids != processor.pad_token_id) for ids in input_ids]
         ).astype(mx.int32)
@@ -1516,6 +1751,28 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
+
+        # Pixel values caching for regular processor path (Production Caching Option 1)
+        # For this path, we still need to run the processor for tokenization, but we can
+        # replace the pixel_values with cached ones (already evaluated tensors = faster)
+        if (
+            PIXEL_VALUES_CACHE_ENABLED
+            and "pixel_values" in model_inputs
+            and original_image_sources
+            and all(src is not None for src in original_image_sources)
+            and len(original_image_sources) == 1
+        ):
+            cached = get_cached_pixel_values(original_image_sources[0])
+            if cached is not None:
+                # Cache HIT - use cached pixel_values (already evaluated)
+                cached_pv, _ = cached
+                model_inputs["pixel_values"] = cached_pv
+                if PIXEL_VALUES_CACHE_DEBUG:
+                    print(f"[PIXEL CACHE] REPLACED processor pixel_values with cached tensor")
+            else:
+                # Cache MISS - cache the pixel_values for next time
+                original_size = (images[0].height, images[0].width) if images and hasattr(images[0], 'height') else (0, 0)
+                cache_pixel_values(original_image_sources[0], model_inputs["pixel_values"], original_size)
 
     if audio_inputs is not None:
         model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
