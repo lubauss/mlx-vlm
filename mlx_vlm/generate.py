@@ -336,45 +336,54 @@ def generate_step(
     # F10 v3: Check multimodal KV cache with PREFIX MATCHING
     mm_cache_hit = False
     mm_prefix_hit = False
-    mm_cross_image_hit = False  # Cross-image match with selective layer recomputation
+    mm_cross_image_hit = False  # Cross-image match with position-based truncation (Option 2)
+    mm_position_truncated = False  # Flag for position-based truncation
     mm_image_hash = None
     prefix_match_len = 0
     staged_forward_info = None  # Info for staged forward pass (cross-image)
 
     if MULTIMODAL_KV_CACHE_ENABLED and pixel_values is not None and not skip_prompt_processing:
-        cached_kv, prefix_match_len, mm_image_hash = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
-
-        # Check if this is a cross-image match (partial KV - some layers are None)
-        is_partial_kv = cached_kv is not None and any(kv is None for kv in cached_kv)
+        cached_kv, prefix_match_len, mm_image_hash, mm_position_truncated = get_cached_multimodal_kv_prefix(pixel_values, input_ids)
 
         # Debug output
         if MULTIMODAL_KV_DEBUG:
             cached_kv_valid = cached_kv is not None and all(kv is not None for kv in cached_kv[:3] if cached_kv)
-            print(f"[DEBUG] generate_step: cached_kv={cached_kv is not None}, prefix_match_len={prefix_match_len}, kv_valid={cached_kv_valid}, is_partial={is_partial_kv}")
+            print(f"[DEBUG] generate_step: cached_kv={cached_kv is not None}, prefix_match_len={prefix_match_len}, kv_valid={cached_kv_valid}, position_truncated={mm_position_truncated}")
 
         if cached_kv is not None and prefix_match_len > 0:
             total_tokens = input_ids.size
 
-            # For cross-image matches, we CANNOT use layer-based selective recomputation.
-            # REASON: Cached KV in ALL layers contains image-dependent representations.
-            # Even if we recompute layers 0-7 with new images, layers 8+ cached KV
-            # still "remembers" the old images through attention.
-            #
-            # Experiment (Jan 25, 2026): Staged forward pass achieved 24% speedup (9.8s vs 13s)
-            # but model hallucinated old images (Hindu deities instead of cats).
-            #
-            # CONCLUSION: Option 1 (layer-based) doesn't work for cross-image.
-            # Need Option 2 (position-based) or full forward pass.
-            if is_partial_kv:
+            # Position-based truncation (Option 2) for cross-image scenarios:
+            # The KV has been truncated to only include positions BEFORE the first image.
+            # We need to restore this truncated KV and do a FULL forward pass for the
+            # remaining tokens (which includes the new image tokens).
+            if mm_position_truncated:
                 mm_cross_image_hit = True
-                if MULTIMODAL_KV_DEBUG:
-                    n_cached = sum(1 for kv in cached_kv if kv is not None)
-                    print(f"[DEBUG] CROSS-IMAGE DETECTED: {n_cached}/{len(cached_kv)} layers")
-                    print(f"[DEBUG]   Layer-based recomputation DISABLED (causes hallucination)")
-                    print(f"[DEBUG]   Falling back to full forward pass for accuracy")
-                # Don't use staged forward - fall back to full forward pass
+                try:
+                    # Restore truncated KV states (text prefix only, no image content)
+                    for i, (layer_cache, cached_state) in enumerate(zip(prompt_cache, cached_kv)):
+                        if cached_state is not None:
+                            layer_cache.keys = cached_state[0]
+                            layer_cache.values = cached_state[1]
+                            if len(cached_state) > 2:
+                                layer_cache.offset = cached_state[2]
+
+                    # This is treated as a PREFIX match - but we need FULL forward pass
+                    # for the remaining tokens because they include new images
+                    mm_prefix_hit = True
+                    if MULTIMODAL_KV_DEBUG:
+                        print(f"[DEBUG] POSITION-TRUNCATED CROSS-IMAGE: {prefix_match_len} tokens cached (pre-image text)")
+                        print(f"[DEBUG]   Will process {total_tokens - prefix_match_len} remaining tokens with FULL vision forward")
+
+                except Exception as e:
+                    mm_cache_hit = False
+                    mm_prefix_hit = False
+                    mm_cross_image_hit = False
+                    prefix_match_len = 0
+                    if MULTIMODAL_KV_DEBUG:
+                        print(f"[DEBUG] Position-truncated KV restoration FAILED: {e}")
             else:
-                # Full KV match - safe to restore all layers
+                # Full KV match (same images) - safe to restore all layers
                 try:
                     # Restore KV states for the matched prefix
                     for i, (layer_cache, cached_state) in enumerate(zip(prompt_cache, cached_kv)):
@@ -407,7 +416,7 @@ def generate_step(
 
     # PREFIX CACHING: Handle different cache scenarios
     if MULTIMODAL_KV_DEBUG:
-        print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}, mm_cross_image={mm_cross_image_hit}")
+        print(f"[DEBUG] Path selection: skip_prompt={skip_prompt_processing}, mm_cache_hit={mm_cache_hit}, mm_prefix_hit={mm_prefix_hit}, mm_cross_image={mm_cross_image_hit}, position_truncated={mm_position_truncated}")
     if skip_prompt_processing and prompt_cache is not None:
         # EXACT cache hit - skip all prompt processing, just get logits for last token
         last_token = input_ids[:, -1:]
@@ -426,25 +435,75 @@ def generate_step(
 
     elif mm_prefix_hit and prefix_match_len > 0:
         # PREFIX cache hit - KV states restored for first N tokens
-        # Process only the remaining tokens through language model
+        # Process only the remaining tokens
         remaining_tokens = input_ids[:, prefix_match_len:]
 
         if remaining_tokens.size > 0:
-            # Process remaining tokens through language model only (vision already encoded in cached KV)
-            excluded_kwargs = {'temp', 'temperature', 'top_p', 'max_tokens', 'token_type_ids',
-                              'pixel_values', 'image_sizes', 'attention_mask', 'position_ids'}
-            lm_kwargs = {k: v for k, v in kwargs.items() if k not in excluded_kwargs}
+            if mm_position_truncated:
+                # CROSS-IMAGE SCENARIO: Images have changed since cached KV was computed.
+                #
+                # IMPORTANT: Position slicing doesn't work reliably for cross-image caching.
+                # The cached KV states contain visual representations from the OLD images.
+                # Even with correct position encoding, the attention mechanism can still
+                # attend to those cached visual tokens, causing hallucination.
+                #
+                # The ONLY reliable approach is full forward pass with fresh cache.
+                # This ensures correct results at the cost of recomputation.
+                #
+                # See: PRODUCTION_CACHING_CAPABILITIES.md for detailed analysis.
+                if MULTIMODAL_KV_DEBUG:
+                    print(f"[DEBUG] Cross-image detected: images changed, full forward pass required")
+                    print(f"[DEBUG]   Cached text prefix available but unused (would cause hallucination)")
 
-            # Process all remaining tokens
-            outputs = model.language_model(
-                remaining_tokens,
-                cache=prompt_cache,
-                **lm_kwargs,
-            )
-            logits = outputs.logits[:, -1, :]
-            quantize_cache_fn(prompt_cache)
-            y, logprobs = sample(logits)
-            mx.async_eval(y)
+                # Reset cache to empty state for clean forward pass
+                for layer_cache in prompt_cache:
+                    if hasattr(layer_cache, 'offset'):
+                        layer_cache.offset = 0
+                    if hasattr(layer_cache, 'keys'):
+                        layer_cache.keys = None
+                    if hasattr(layer_cache, 'values'):
+                        layer_cache.values = None
+
+                # Full forward pass with all tokens and new images
+                outputs = model(input_ids, pixel_values, cache=prompt_cache, mask=mask, **kwargs)
+                logits = outputs.logits[:, -1, :]
+                quantize_cache_fn(prompt_cache)
+                y, logprobs = sample(logits)
+                mx.async_eval(y)
+
+                # Cache KV states for future prefix matching
+                if MULTIMODAL_KV_CACHE_ENABLED and pixel_values is not None:
+                    try:
+                        if mm_image_hash is None:
+                            mm_image_hash = _get_image_hash(pixel_values)
+                        kv_states = []
+                        for layer_cache in prompt_cache:
+                            if hasattr(layer_cache, 'state') and layer_cache.state is not None:
+                                state = layer_cache.state
+                                mx.eval(state[0], state[1])
+                                kv_states.append((state[0], state[1], layer_cache.offset if hasattr(layer_cache, 'offset') else 0))
+                            else:
+                                kv_states.append(None)
+                        cache_multimodal_kv_prefix(mm_image_hash, input_ids, kv_states, input_ids.size)
+                    except Exception:
+                        pass
+
+            elif not mm_position_truncated:
+                # Same images - process remaining tokens through language model only (vision already encoded in cached KV)
+                excluded_kwargs = {'temp', 'temperature', 'top_p', 'max_tokens', 'token_type_ids',
+                                  'pixel_values', 'image_sizes', 'attention_mask', 'position_ids'}
+                lm_kwargs = {k: v for k, v in kwargs.items() if k not in excluded_kwargs}
+
+                # Process all remaining tokens
+                outputs = model.language_model(
+                    remaining_tokens,
+                    cache=prompt_cache,
+                    **lm_kwargs,
+                )
+                logits = outputs.logits[:, -1, :]
+                quantize_cache_fn(prompt_cache)
+                y, logprobs = sample(logits)
+                mx.async_eval(y)
 
             # Cache the extended sequence for future use
             if MULTIMODAL_KV_CACHE_ENABLED and mm_image_hash:

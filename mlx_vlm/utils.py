@@ -139,16 +139,25 @@ MULTIMODAL_KV_CACHE_MAX_SIZE = 0  # 0 = unlimited (context length is the natural
 MULTIMODAL_KV_CACHE_TTL_SECONDS = 60  # Cache expires after 60s of inactivity (0 = no expiry)
 MULTIMODAL_KV_DEBUG = True  # Enable debug logging for prefix matching
 
-# Cross-Image Prefix Caching with Selective Layer Recomputation
-# Based on VLCache research: https://arxiv.org/abs/2512.12977
-# Early layers are vision-critical (depend on image content)
-# Later layers are language-critical (safe to reuse across images)
+# Cross-Image Prefix Caching with Position-Based Truncation (Option 2)
+# Instead of layer-based recomputation (Option 1 - causes hallucination),
+# we use position-based truncation:
+# - Text tokens BEFORE first image: Safe to reuse (no image dependency)
+# - Image tokens and text AFTER: Must be recomputed with new images
+#
+# This is similar to MPIC (Multimodal Position-Independent Caching) approach:
+# Cache only the "pure text" prefix that doesn't depend on any image content.
 CROSS_IMAGE_CACHING_ENABLED = True  # Enable cross-image prefix matching
-VISION_CRITICAL_LAYERS = 8  # Layers 0 to N-1 must be recomputed when images change
-                            # Layers N to end can be reused from cache
+VISION_CRITICAL_LAYERS = 8  # Kept for backward compatibility but not used in Option 2
+
+# Qwen3-VL vision token IDs (used to detect first_image_position)
+QWEN3_VISION_START_TOKEN_ID = 151652  # <|vision_start|>
+QWEN3_IMAGE_TOKEN_ID = 151655          # <|image_pad|>
 
 # Global multimodal KV cache with prefix matching support
-# Structure: {image_hash: [(token_ids, kv_states, num_tokens), ...]}
+# Structure: {image_hash: [(token_ids, kv_states, num_tokens, first_image_position), ...]}
+# Note: first_image_position = -1 means no images (text-only), otherwise it's the
+# position of the first <|vision_start|> token
 _multimodal_prefix_cache: Dict[str, List[Tuple[List[int], Any, int]]] = {}
 _multimodal_cache_access_order: List[str] = []  # Track image_hash access for LRU
 _multimodal_cache_last_access: float = 0.0  # Timestamp of last cache access
@@ -188,16 +197,23 @@ def _get_image_hash(pixel_values) -> str:
     return _hash_pixel_values(pixel_values)
 
 
-def _find_longest_prefix_match(token_ids: List[int], cached_entries: List[Tuple[List[int], Any, int]]) -> Tuple[Any, int, int]:
+def _find_longest_prefix_match(token_ids: List[int], cached_entries: List) -> Tuple[Any, int, int, int]:
     """
     Find the longest matching prefix among cached entries.
 
     Returns:
-        Tuple of (kv_states, num_matched_tokens, entry_index) or (None, 0, -1) if no match
+        Tuple of (kv_states, num_matched_tokens, entry_index, first_image_position) or (None, 0, -1, -1) if no match
     """
-    best_match = (None, 0, -1)
+    best_match = (None, 0, -1, -1)
 
-    for idx, (cached_tokens, kv_states, num_tokens) in enumerate(cached_entries):
+    for idx, entry in enumerate(cached_entries):
+        # Handle both old 3-tuple and new 4-tuple format
+        if len(entry) == 4:
+            cached_tokens, kv_states, num_tokens, first_image_pos = entry
+        else:
+            cached_tokens, kv_states, num_tokens = entry
+            first_image_pos = -1  # Unknown for legacy entries
+
         # Find how many tokens match from the start
         match_len = 0
         min_len = min(len(token_ids), len(cached_tokens))
@@ -209,7 +225,7 @@ def _find_longest_prefix_match(token_ids: List[int], cached_entries: List[Tuple[
                 break
 
         if MULTIMODAL_KV_DEBUG:
-            print(f"  [DEBUG] Entry {idx}: cached={len(cached_tokens)}, query={len(token_ids)}, match={match_len}")
+            print(f"  [DEBUG] Entry {idx}: cached={len(cached_tokens)}, query={len(token_ids)}, match={match_len}, first_img_pos={first_image_pos}")
             if match_len < len(cached_tokens) and match_len < len(token_ids):
                 # Show where mismatch occurred
                 if match_len < min_len:
@@ -219,12 +235,12 @@ def _find_longest_prefix_match(token_ids: List[int], cached_entries: List[Tuple[
         # and the match should be the full cached sequence (we can extend from there)
         if match_len >= min(50, len(cached_tokens)) and match_len == len(cached_tokens):
             if match_len > best_match[1]:
-                best_match = (kv_states, match_len, idx)
+                best_match = (kv_states, match_len, idx, first_image_pos)
 
     return best_match
 
 
-def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, str]:
+def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, str, bool]:
     """
     Get cached KV states with prefix matching for multimodal input.
 
@@ -236,15 +252,16 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
         input_ids: Text input token IDs
 
     Returns:
-        Tuple of (kv_states, num_matched_tokens, image_hash)
+        Tuple of (kv_states, num_matched_tokens, image_hash, is_position_truncated)
         - kv_states: Cached KV states for the prefix, or None if no match
         - num_matched_tokens: Number of tokens covered by the cache
         - image_hash: Hash of the image for caching new states
+        - is_position_truncated: True if this is a cross-image match with position-based truncation
     """
     global _kv_cache_hits, _kv_cache_misses, _kv_cache_cross_image_hits, _kv_cache_tokens_matched, _kv_cache_tokens_total
 
     if not MULTIMODAL_KV_CACHE_ENABLED:
-        return None, 0, ""
+        return None, 0, "", False
 
     # Check TTL and clear expired cache (also updates last access time)
     _check_cache_ttl()
@@ -261,62 +278,81 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
     _kv_cache_tokens_total += len(token_list)
 
     # First, try exact image hash match (fast path)
-    kv_states, match_len, entry_idx = None, 0, -1
+    kv_states, match_len, entry_idx, first_img_pos = None, 0, -1, -1
     matched_hash = image_hash
+    is_position_truncated = False  # Flag for Option 2 position-based truncation
 
     if image_hash in _multimodal_prefix_cache:
         cached_entries = _multimodal_prefix_cache[image_hash]
         if MULTIMODAL_KV_DEBUG:
             print(f"[DEBUG] KV Cache lookup (exact): image={image_hash[:8]}, query_len={len(token_list)}, num_entries={len(cached_entries)}")
-        kv_states, match_len, entry_idx = _find_longest_prefix_match(token_list, cached_entries)
+        kv_states, match_len, entry_idx, first_img_pos = _find_longest_prefix_match(token_list, cached_entries)
 
-    # Cross-image prefix matching with SELECTIVE LAYER RECOMPUTATION
-    # Based on VLCache research: early layers are vision-critical, later layers are language-critical
-    # When images change:
-    # - Vision-critical layers (0 to VISION_CRITICAL_LAYERS-1): Return None -> force recomputation
-    # - Language-critical layers (VISION_CRITICAL_LAYERS to end): Return cached -> safe to reuse
+    # Cross-image prefix matching with POSITION-BASED TRUNCATION (Option 2)
+    # Instead of layer-based recomputation (Option 1 - causes hallucination),
+    # we truncate the KV cache to only include positions BEFORE the first image.
     #
-    # This allows ~70% token reuse while maintaining accuracy on new images.
+    # Key insight:
+    # - Text tokens before first image: No image dependency, safe to reuse
+    # - Image tokens and text after: Have image-dependent attention, must recompute
+    #
+    # This is more conservative than layer-based but guarantees accuracy.
 
     is_cross_image_match = False
 
     if CROSS_IMAGE_CACHING_ENABLED and kv_states is None and len(_multimodal_prefix_cache) > 0:
         if MULTIMODAL_KV_DEBUG:
-            print(f"[DEBUG] KV Cache: no exact image match, searching across {len(_multimodal_prefix_cache)} image hashes for selective reuse...")
+            print(f"[DEBUG] KV Cache: no exact image match, searching across {len(_multimodal_prefix_cache)} image hashes for position-based reuse...")
 
-        best_cross_match = (None, 0, -1, None)  # (kv_states, match_len, entry_idx, source_hash)
+        best_cross_match = (None, 0, -1, None, -1)  # (kv_states, match_len, entry_idx, source_hash, first_img_pos)
 
         for other_hash, other_entries in _multimodal_prefix_cache.items():
             if other_hash == image_hash:
                 continue  # Already checked
-            cross_kv, cross_len, cross_idx = _find_longest_prefix_match(token_list, other_entries)
+            cross_kv, cross_len, cross_idx, cross_first_img = _find_longest_prefix_match(token_list, other_entries)
             if cross_len > best_cross_match[1]:
-                best_cross_match = (cross_kv, cross_len, cross_idx, other_hash)
+                best_cross_match = (cross_kv, cross_len, cross_idx, other_hash, cross_first_img)
 
         if best_cross_match[0] is not None:
-            full_kv_states, match_len, entry_idx, matched_hash = best_cross_match
+            full_kv_states, full_match_len, entry_idx, matched_hash, cached_first_img_pos = best_cross_match
 
-            # SELECTIVE LAYER RECOMPUTATION: Only return language-critical layers
-            # Vision-critical layers (0 to VISION_CRITICAL_LAYERS-1) are set to None
-            # This forces the model to recompute them with the NEW images
-            partial_kv_states = []
-            for layer_idx, layer_kv in enumerate(full_kv_states):
-                if layer_idx >= VISION_CRITICAL_LAYERS:
-                    # Language-critical layer: safe to reuse
-                    partial_kv_states.append(layer_kv)
-                else:
-                    # Vision-critical layer: must recompute with new images
-                    partial_kv_states.append(None)
+            # POSITION-BASED TRUNCATION (Option 2):
+            # Only reuse KV for positions BEFORE the first image token
+            # This ensures we don't carry over any image-dependent attention patterns
 
-            kv_states = partial_kv_states
-            is_cross_image_match = True
+            if cached_first_img_pos > 0:
+                # Truncate KV to only include positions [0, first_image_position)
+                truncated_kv_states = []
+                for layer_idx, layer_kv in enumerate(full_kv_states):
+                    if layer_kv is not None:
+                        keys, values = layer_kv[0], layer_kv[1]
+                        # KV shape: [batch, heads, seq_len, head_dim]
+                        truncated_keys = keys[:, :, :cached_first_img_pos, :]
+                        truncated_values = values[:, :, :cached_first_img_pos, :]
+                        # Update offset if present
+                        if len(layer_kv) > 2:
+                            truncated_kv_states.append((truncated_keys, truncated_values, cached_first_img_pos))
+                        else:
+                            truncated_kv_states.append((truncated_keys, truncated_values))
+                    else:
+                        truncated_kv_states.append(None)
 
-            if MULTIMODAL_KV_DEBUG:
-                n_reused = sum(1 for kv in partial_kv_states if kv is not None)
-                n_total = len(partial_kv_states)
-                print(f"[DEBUG] KV Cache CROSS-IMAGE HIT (selective): matched {match_len} tokens from image hash {matched_hash[:8]}")
-                print(f"[DEBUG]   Layers reused: {n_reused}/{n_total} (layers {VISION_CRITICAL_LAYERS}-{n_total-1})")
-                print(f"[DEBUG]   Layers to recompute: {VISION_CRITICAL_LAYERS} (layers 0-{VISION_CRITICAL_LAYERS-1})")
+                kv_states = truncated_kv_states
+                match_len = cached_first_img_pos  # We only return this many tokens' worth of KV
+                first_img_pos = cached_first_img_pos
+                is_cross_image_match = True
+                is_position_truncated = True
+
+                if MULTIMODAL_KV_DEBUG:
+                    print(f"[DEBUG] KV Cache CROSS-IMAGE HIT (position-based): matched from image hash {matched_hash[:8]}")
+                    print(f"[DEBUG]   Original cached: {full_match_len} tokens")
+                    print(f"[DEBUG]   Truncated to: {match_len} tokens (before first_image_position={cached_first_img_pos})")
+                    print(f"[DEBUG]   Will recompute: positions {cached_first_img_pos} to {len(token_list)-1} ({len(token_list) - cached_first_img_pos} tokens)")
+            else:
+                # No image in cached sequence or position unknown - can't safely truncate
+                # Fall back to full forward pass
+                if MULTIMODAL_KV_DEBUG:
+                    print(f"[DEBUG] KV Cache CROSS-IMAGE: first_image_position={cached_first_img_pos}, cannot truncate - falling back to full forward pass")
 
     if kv_states is not None:
         # Update LRU order for the matched hash
@@ -336,7 +372,20 @@ def get_cached_multimodal_kv_prefix(pixel_values, input_ids) -> Tuple[Any, int, 
         if MULTIMODAL_KV_DEBUG:
             print(f"[DEBUG] KV Cache MISS: no prefix match found across {len(_multimodal_prefix_cache)} image hashes")
 
-    return kv_states, match_len, image_hash
+    return kv_states, match_len, image_hash, is_position_truncated
+
+
+def _find_first_image_position(token_ids: List[int]) -> int:
+    """
+    Find the position of the first image token in the sequence.
+
+    Returns:
+        Position of first <|vision_start|> token, or -1 if no images found.
+    """
+    try:
+        return token_ids.index(QWEN3_VISION_START_TOKEN_ID)
+    except ValueError:
+        return -1  # No image tokens found
 
 
 def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens: int):
@@ -364,21 +413,25 @@ def cache_multimodal_kv_prefix(image_hash: str, token_ids, kv_states, num_tokens
     else:
         token_list = list(token_ids.reshape(-1))
 
+    # Find first image position for position-based cross-image caching (Option 2)
+    first_image_position = _find_first_image_position(token_list)
+
     # Initialize cache for this image if needed
     if image_hash not in _multimodal_prefix_cache:
         _multimodal_prefix_cache[image_hash] = []
 
     # Check if we already have this exact sequence cached
-    for cached_tokens, _, _ in _multimodal_prefix_cache[image_hash]:
+    for entry in _multimodal_prefix_cache[image_hash]:
+        cached_tokens = entry[0]
         if cached_tokens == token_list:
             if MULTIMODAL_KV_DEBUG:
                 print(f"[DEBUG] KV Cache: already cached sequence of {len(token_list)} tokens")
             return  # Already cached
 
-    # Add new entry
-    _multimodal_prefix_cache[image_hash].append((token_list, kv_states, num_tokens))
+    # Add new entry with first_image_position
+    _multimodal_prefix_cache[image_hash].append((token_list, kv_states, num_tokens, first_image_position))
     if MULTIMODAL_KV_DEBUG:
-        print(f"[DEBUG] KV Cache STORE: image={image_hash[:8]}, tokens={len(token_list)}, kv_layers={sum(1 for kv in kv_states if kv is not None)}")
+        print(f"[DEBUG] KV Cache STORE: image={image_hash[:8]}, tokens={len(token_list)}, kv_layers={sum(1 for kv in kv_states if kv is not None)}, first_img_pos={first_image_position}")
 
     # Update LRU order
     if image_hash in _multimodal_cache_access_order:
